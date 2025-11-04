@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 """
 DoorKam Security Camera System - Python 3.14 Free-Threaded Edition
@@ -19,7 +21,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 # Python 3.14 version check
 if sys.version_info < (3, 14):
-    logging.warning(f"[WARN]️  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
+    logging.warning(f"[WARN]  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
     logging.warning("   Some features may not be available or may have reduced performance")
     logging.warning("   Install Python 3.14 for optimal performance")
 
@@ -85,9 +87,9 @@ elif os.getenv('PYTHON_GIL') == '0':
 # Log Python 3.14 capabilities
 if sys.version_info >= (3, 14):
     if GIL_DISABLED:
-        logging.info("🚀 Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
+        logging.info("[ROCKET] Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
     else:
-        logging.warning("[WARN]️  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
+        logging.warning("[WARN]  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
 
     if SUBINTERPRETERS_AVAILABLE:
         logging.info("[OK] Subinterpreters available (PEP 734)")
@@ -4914,4 +4916,3 @@ def add_timer_info_to_frame(frame):
 if __name__ == "__main__":
     os.environ["QT_QPA_PLATFORM"] = "xcb"
     main()
-
