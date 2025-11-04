@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 
 # Python 3.14 version check
 if sys.version_info < (3, 14):
-    logging.warning(f"⚠️  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
+    logging.warning(f"[WARN]️  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
     logging.warning("   Some features may not be available or may have reduced performance")
     logging.warning("   Install Python 3.14 for optimal performance")
 
@@ -87,12 +87,12 @@ if sys.version_info >= (3, 14):
     if GIL_DISABLED:
         logging.info("🚀 Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
     else:
-        logging.warning("⚠️  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
+        logging.warning("[WARN]️  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
 
     if SUBINTERPRETERS_AVAILABLE:
-        logging.info("✓ Subinterpreters available (PEP 734)")
+        logging.info("[OK] Subinterpreters available (PEP 734)")
     else:
-        logging.info("ℹ Subinterpreters not available - using standard threading")
+        logging.info("[INFO] Subinterpreters not available - using standard threading")
 
 # Load environment variables
 load_dotenv()
@@ -970,7 +970,7 @@ def load_config_modern() -> AppConfig:
             yolo_processor = ParallelYOLOProcessor(app_config.yolo, num_workers=num_workers)
             logging.info(f"Initialized YOLO processor with {num_workers} workers")
 
-        logging.info("✓ Loaded type-safe configuration successfully")
+        logging.info("[OK] Loaded type-safe configuration successfully")
         return app_config
 
     except Exception as e:
@@ -1363,7 +1363,7 @@ def usb_camera_process(usb_queue, rotation_value, cam2_available, cam2_resolutio
                 if abs(new_rotation - stable_rotation) >= 90:
                     stable_rotation = new_rotation
                     last_rotation_update = current_time
-                    logging.info(f"USB camera rotation stabilized at {stable_rotation}°")
+                    logging.info(f"USB camera rotation stabilized at {stable_rotation}deg")
 
         # Try to read frame
         ret, frame = usb_cam.read()
@@ -1617,7 +1617,7 @@ def video_stream():
     web_cam2_rotation = session.get('web_cam2_rotation', 0)
     
     # Log the web rotation settings
-    logging.debug(f"Web stream started with cam1_web_rotation={web_cam1_rotation}°, cam2_web_rotation={web_cam2_rotation}°")
+    logging.debug(f"Web stream started with cam1_web_rotation={web_cam1_rotation}deg, cam2_web_rotation={web_cam2_rotation}deg")
     
     # Pass both web rotations to gen_frames - these are independent from local display rotations
     return Response(gen_frames(web_cam1_rotation, web_cam2_rotation), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -1633,7 +1633,7 @@ def rotate_web_cam1():
     if current_time - last_rotation_time >= ROTATION_COOLDOWN:
         session['web_cam1_rotation'] = (session.get('web_cam1_rotation', 0) + 90) % 360
         last_rotation_time = current_time
-        logging.info(f"Web: Camera 1 rotation set to {session['web_cam1_rotation']}° (web UI only)")
+        logging.info(f"Web: Camera 1 rotation set to {session['web_cam1_rotation']}deg (web UI only)")
     return redirect(url_for('video_feed'))
 
 @app.route('/rotate_web_cam2', methods=['POST'])
@@ -1648,7 +1648,7 @@ def rotate_web_cam2():
         # Update only the web rotation in session - don't modify the shared cam2_rotation value
         session['web_cam2_rotation'] = (session.get('web_cam2_rotation', 0) + 90) % 360
         last_rotation_time = current_time
-        logging.info(f"Web: Camera 2 rotation set to {session['web_cam2_rotation']}° (web UI only)")
+        logging.info(f"Web: Camera 2 rotation set to {session['web_cam2_rotation']}deg (web UI only)")
     return redirect(url_for('video_feed'))
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -2345,11 +2345,11 @@ def create_gif_from_video(video_path, output_gif_path, max_frames=60, fps=10):
     if motion_source_camera == "cam2":
         with cam2_rotation.get_lock():
             rotation = cam2_rotation.value
-        logging.debug(f"Using Camera 2 rotation for GIF: {rotation}°")
+        logging.debug(f"Using Camera 2 rotation for GIF: {rotation}deg")
     else:
         with email_rotation_cam1.get_lock(): # Indent this block
             rotation = email_rotation_cam1.value
-            logging.debug(f"Using Camera 1 rotation for GIF: {rotation}°")
+            logging.debug(f"Using Camera 1 rotation for GIF: {rotation}deg")
 
     while cap.isOpened() and len(frames) < target_frames:
         ret, frame = cap.read()
@@ -2366,7 +2366,7 @@ def create_gif_from_video(video_path, output_gif_path, max_frames=60, fps=10):
 
     if frames:
         imageio.mimsave(output_gif_path, frames, fps=fps)
-        logging.debug(f"GIF created: {output_gif_path}, {len(frames)} frames at {fps} FPS with rotation {rotation}°")
+        logging.debug(f"GIF created: {output_gif_path}, {len(frames)} frames at {fps} FPS with rotation {rotation}deg")
     else:
         logging.error(f"No frames extracted from {video_path}")
         raise ValueError("Failed to create GIF")
@@ -2425,11 +2425,11 @@ def send_media_via_gmail(image, video_path, sender_email, receiver_emails, passw
     if motion_source_camera == "cam2":
         with cam2_rotation.get_lock():
             rotation = cam2_rotation.value
-        logging.debug(f"Using Camera 2 rotation for email image: {rotation}°")
+        logging.debug(f"Using Camera 2 rotation for email image: {rotation}deg")
     else:
         with email_rotation_cam1.get_lock(): # Indent this block
             rotation = email_rotation_cam1.value
-            logging.debug(f"Using Camera 1 rotation for email image: {rotation}°") # Ensure this line is also correctly indented
+            logging.debug(f"Using Camera 1 rotation for email image: {rotation}deg") # Ensure this line is also correctly indented
     
     rotated_image = apply_rotation(image, rotation)
     resized_image = cv2.resize(rotated_image, (320, 240), interpolation=cv2.INTER_AREA)
@@ -2671,7 +2671,7 @@ class SettingsDialog(tk.Toplevel):
         self.email_password = tk.StringVar(value=config.get('email_password', ''))
         self.users = [(tk.StringVar(value=user['email']), tk.StringVar(value="********")) for user in config.get('users', [])]
         self.detection_camera = tk.StringVar(value=config.get('detection_camera', 'cam1'))
-        self.email_rotation_label = tk.StringVar(value=f"Email Rotation: {email_rotation_cam1.value}°")
+        self.email_rotation_label = tk.StringVar(value=f"Email Rotation: {email_rotation_cam1.value}deg")
         
         # Timer schedule settings
         self.timer_enabled = tk.BooleanVar(value=config.get('timer_enabled', False))
@@ -3077,7 +3077,7 @@ class SettingsDialog(tk.Toplevel):
         global email_rotation_cam1
         with email_rotation_cam1.get_lock():
             email_rotation_cam1.value = (email_rotation_cam1.value + 90) % 360
-            self.email_rotation_label.set(f"Email Rotation: {email_rotation_cam1.value}°")
+            self.email_rotation_label.set(f"Email Rotation: {email_rotation_cam1.value}deg")
             logging.info(f"Settings: Email rotation set to {email_rotation_cam1.value} degrees")
 
     def toggle_roi_selection(self):
@@ -4391,7 +4391,7 @@ def main():
                         if contains_objects:
                             if yolo_stage == "roi":
                                 # Person detected in ROI - transition to full frame verification
-                                logging.info(f"✓ Person detected in ROI on {result_camera.upper()} (took {processing_time:.2f}s), proceeding to full frame verification")
+                                logging.info(f"[OK] Person detected in ROI on {result_camera.upper()} (took {processing_time:.2f}s), proceeding to full frame verification")
                                 roi_yolo_detected_person = True
                                 yolo_stage = "full_frame"
                                 full_frame_yolo_start_time = current_time
@@ -4415,7 +4415,7 @@ def main():
 
                             elif yolo_stage == "full_frame":
                                 # Person confirmed in full frame - trigger capture
-                                logging.info(f"✓ Person CONFIRMED in full frame on {result_camera.upper()} (took {processing_time:.2f}s), triggering capture")
+                                logging.info(f"[OK] Person CONFIRMED in full frame on {result_camera.upper()} (took {processing_time:.2f}s), triggering capture")
                                 yolo_detected_object = True
                                 yolo_analysis_active = False
                                 yolo_stage = None
