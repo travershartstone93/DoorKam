@@ -458,6 +458,8 @@ class DetectionStateManager:
     
     def reset(self):
         """Reset state variables"""
+        global yolo_annotated_pi_frame, yolo_annotated_usb_frame
+
         self.motion_start_time = None
         self.motion_confirmed_time = None
         self.roi_yolo_start_time = None
@@ -466,6 +468,10 @@ class DetectionStateManager:
         self.roi_detected_person = False
         self.full_frame_detected_person = False
         self.source_camera = None
+
+        # BUGFIX: Clear YOLO annotated frames to prevent reuse across detection events
+        yolo_annotated_pi_frame = None
+        yolo_annotated_usb_frame = None
     
     def check_timeout(self, current_time: float) -> bool:
         """Check timeouts, return True if timeout occurred"""
