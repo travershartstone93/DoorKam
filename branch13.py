@@ -66,6 +66,7 @@ from collections import deque
 from functools import wraps
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum, auto
 
 # Python 3.14 specific: Check for subinterpreters (PEP 734)
 SUBINTERPRETERS_AVAILABLE = False
@@ -103,6 +104,8 @@ MIN_CONTOUR_AREA = 100  # Pixels (reduced from 500 for low-contrast detection)
 MIN_RECORDING_DURATION = 10  # Seconds
 ROTATION_COOLDOWN = 0.5  # Seconds
 FRAME_QUEUE_SIZE = 30  # Frames - increased from 10 to reduce dropped frames under load
+YOLO_ROI_TIMEOUT = 5.0  # Seconds - timeout for ROI YOLO analysis
+YOLO_FULL_FRAME_TIMEOUT = 10.0  # Seconds - timeout for full frame YOLO analysis
 
 # ============================================================================
 # PYTHON 3.14: Type-Safe Configuration Classes
@@ -2569,10 +2572,10 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
                 # Skip motion detection during warmup frames
                 if frame_count <= SKIP_DETECTION_FRAMES:
                     # Return no motion detected during warmup to let background model stabilize
-                    return frame_with_roi, False, None, False
+                    return frame_with_roi, False, None
             else:
                 logging.warning(f"Background subtractor for {camera} is None, cannot process.")
-                return frame_with_roi, False, None, False # Return None for previous_frame
+                return frame_with_roi, False, None # Return None for previous_frame
 
         else:
             # Use original frame differencing method
@@ -2888,6 +2891,93 @@ def toggle_visibility(event, x, y, flags, param):
             logging.info("Button was not visible - showing toggle dialog")
             toggle_dialog.show()
         toggle_dialog.last_click_time = time.time()
+
+# ToggleDialog
+class ToggleDialog(tk.Toplevel):
+    def __init__(self, root):
+        super().__init__(root)
+        self.root = root
+
+        # Remove all window decorations
+        self.overrideredirect(True)
+        self.geometry("120x40")
+        self.attributes('-topmost', True)
+        self.withdraw()
+
+        # Just a single button
+        self.toggle_button = ttk.Button(self, text="Armed" if email_armed else "Disarmed", command=self.toggle_state)
+        self.toggle_button.pack(fill="both", expand=True)
+
+        self.last_click_time = time.time()
+        self.timer_thread = threading.Thread(target=self.auto_hide, daemon=True)
+        self.timer_thread.start()
+        logging.info("ToggleDialog initialized")
+
+    def toggle_state(self):
+        global email_armed, cooldown_active, detection_active
+        email_armed = not email_armed
+        detection_active = email_armed
+        if email_armed and cooldown_active:
+            cooldown_active = False
+            logging.info("Cooldown overridden by manual arming")
+        self.toggle_button.config(text="Armed" if email_armed else "Disarmed")
+        self.last_click_time = time.time()
+        logging.info(f"Detection emails {'armed' if email_armed else 'disarmed'}")
+        logging.info(f"Detection active also set to: {detection_active}")
+
+    def show(self):
+        if self.winfo_exists():
+            self.deiconify()
+            self.lift()
+            global button_visible
+            button_visible = True
+            self.last_click_time = time.time()
+
+    def hide(self):
+        if self.winfo_exists():
+            self.withdraw()
+            global button_visible
+            button_visible = False
+
+    def auto_hide(self):
+        while True:
+            try:
+                if button_visible and time.time() - self.last_click_time >= 10:
+                    # Use after() to schedule hide in the main thread
+                    self.root.after(0, self.hide)
+            except Exception as e:
+                logging.error(f"Error in auto_hide: {e}")
+            time.sleep(1)
+
+    def on_close(self):
+        if self.winfo_exists():
+            self.hide()
+
+    def update_status(self):
+        """Update the toggle dialog to reflect current camera and detection status"""
+        global email_armed, cooldown_active, detection_camera
+
+        # Check if Camera 2 is available
+        with cam2_available.get_lock():
+            cam2_is_available = cam2_available.value
+
+        # If Camera 2 is not available and detection is set to cam2 or both,
+        # reset to cam1
+        if not cam2_is_available and detection_camera in ['cam2', 'both']:
+            detection_camera = 'cam1'
+            logging.info("Reset detection camera to 'cam1' in ToggleDialog since Camera 2 is unavailable")
+
+            # Update global config to match
+            config['detection_camera'] = 'cam1'
+            try:
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(config, f, indent=4)
+                logging.info("Updated config file with new detection camera setting")
+            except Exception as e:
+                logging.error(f"Failed to update config file: {e}")
+
+        # Update button text
+        self.toggle_button.config(text="Armed" if email_armed else "Disarmed")
 
 # SettingsDialog
 class SettingsDialog(tk.Toplevel):
@@ -3953,13 +4043,15 @@ def main():
     global cap, toggle_dialog, settings_dialog, detection_camera, motion_source_camera
     # PYTHON 3.14: Removed old YOLO worker globals (yolo_worker_thread, yolo_worker_running, yolo_request_queue, yolo_response_queue)
     global yolo_annotated_pi_frame, yolo_annotated_usb_frame
-    global roi_selection_mode, roi_temp
+    global roi_selection_mode, roi_temp, pending_roi_activation, pending_ui_update
 
     root = tk.Tk()
     root.withdraw()
 
     video_writer = temp_video_file = None
     pi_previous_frame = None  # Keep for frame differencing method
+    usb_previous_frame = None  # Keep for frame differencing method
+    detection_check_start = None  # Track detection timing
     # Initialize last_timer_check
     last_timer_check = time.time()
 
@@ -4138,6 +4230,7 @@ def main():
         cam2_res_w, cam2_res_h = 320, 240 # Fallback resolution
     last_usb_frame = np.zeros((cam2_res_h, cam2_res_w, 3), dtype=np.uint8) # Initialize blank USB frame
     last_usb_frame_raw = last_usb_frame.copy()  # Initialize raw frame buffer
+    last_pi_frame_raw = last_pi_frame.copy()  # Initialize raw pi frame buffer
     processed_pi_frame = last_pi_frame.copy()  # Initialize processed frames
     processed_usb_frame = last_usb_frame.copy() # Initialize processed frames
 
@@ -4218,6 +4311,9 @@ def main():
         ret = False
         if cap and cap.isOpened():
             ret, pi_frame = cap.read()
+            # Store raw frame to avoid compound rotation
+            if ret and pi_frame is not None:
+                last_pi_frame_raw = pi_frame.copy()
             if not ret:
                  logging.warning("Failed to grab Pi camera frame")
 
@@ -4255,7 +4351,7 @@ def main():
                              if ret_restart and frame_restart is not None:
                                  pi_camera_reconnector.record_attempt(current_time, success=True)
                                  pi_frame = frame_restart
-                                 last_pi_frame = pi_frame.copy()
+                                 last_pi_frame_raw = pi_frame.copy()
                                  logging.info("Pi camera reconnected and frame captured successfully")
                                  continue  # Process this frame
                              else:
@@ -4280,17 +4376,20 @@ def main():
                     except (AttributeError, ValueError) as e:
                        logging.debug(f"Could not get shape from last_pi_frame: {e}")
                        h, w = cam1_res_h, cam1_res_w
-                    last_pi_frame = np.zeros((h, w, 3), dtype=np.uint8)
+                    blank_frame = np.zeros((h, w, 3), dtype=np.uint8)
+                    last_pi_frame = blank_frame
+                    last_pi_frame_raw = blank_frame.copy()
                     # Continue loop - will retry based on backoff timer
 
         # Use last valid frame if current read failed but cap exists
         if pi_frame is None:
-            pi_frame_to_process = last_pi_frame # Use the blank or last good frame
+            pi_frame_to_process = last_pi_frame_raw # Use raw frame to avoid compound rotation
         else:
             # Ensure frame has correct dimensions (might be needed if pipeline restarts with different res?)
-            if pi_frame.shape[0] != last_pi_frame.shape[0] or pi_frame.shape[1] != last_pi_frame.shape[1]:
+            # BUGFIX: Compare to RAW frame, not processed frame (which may be rotated with swapped dimensions)
+            if pi_frame.shape[0] != last_pi_frame_raw.shape[0] or pi_frame.shape[1] != last_pi_frame_raw.shape[1]:
                  try:
-                     pi_frame = cv2.resize(pi_frame, (last_pi_frame.shape[1], last_pi_frame.shape[0]))
+                     pi_frame = cv2.resize(pi_frame, (last_pi_frame_raw.shape[1], last_pi_frame_raw.shape[0]))
                      logging.warning("Resized incoming Pi frame to match expected dimensions.")
                  except Exception as resize_err:
                      logging.error(f"Failed to resize Pi frame: {resize_err}. Using last good frame.")
@@ -4311,9 +4410,10 @@ def main():
 
         if usb_frame is not None:
             # Ensure frame has correct dimensions
-            if last_usb_frame is not None and (usb_frame.shape[0] != last_usb_frame.shape[0] or usb_frame.shape[1] != last_usb_frame.shape[1]):
+            # BUGFIX: Compare to RAW frame, not processed frame (which may be rotated with swapped dimensions)
+            if last_usb_frame_raw is not None and (usb_frame.shape[0] != last_usb_frame_raw.shape[0] or usb_frame.shape[1] != last_usb_frame_raw.shape[1]):
                  try:
-                    usb_frame = cv2.resize(usb_frame, (last_usb_frame.shape[1], last_usb_frame.shape[0]))
+                    usb_frame = cv2.resize(usb_frame, (last_usb_frame_raw.shape[1], last_usb_frame_raw.shape[0]))
                     logging.warning("Resized incoming USB frame to match expected dimensions.")
                  except Exception as resize_err:
                      logging.error(f"Failed to resize USB frame: {resize_err}. Using last good frame.")
@@ -4336,6 +4436,12 @@ def main():
             # PYTHON 3.14: Clear Pi frame queue for web feed
             while frame_queue.get() is not None:
                 pass  # Drain the queue
+            # Read a fresh frame directly from camera to update raw buffer
+            if cap and cap.isOpened():
+                ret_fresh, fresh_pi_frame = cap.read()
+                if ret_fresh and fresh_pi_frame is not None:
+                    last_pi_frame_raw = fresh_pi_frame.copy()
+                    logging.debug(f"Main: Got fresh Pi frame after rotation change")
             logging.debug(f"Main: Reset Pi cam state, rotation now {current_cam1_rotation}")
 
         # Handle cam2 rotation - drain buffered frames immediately
@@ -4355,9 +4461,15 @@ def main():
                     drained_count += 1
             except queue.Empty:
                 pass
-            # Reset raw frame buffer to prevent using old pre-rotation frame
-            last_usb_frame_raw = None
-            logging.debug(f"Main: Reset USB cam state, rotation now {current_cam2_rotation}, drained {drained_count} old frames, cleared raw buffer")
+            # Wait for a fresh frame from the queue (timeout after 1 second)
+            try:
+                fresh_frame = usb_frame_queue.get(timeout=1.0)
+                if fresh_frame is not None:
+                    last_usb_frame_raw = fresh_frame.copy()
+                    logging.debug(f"Main: Got fresh frame after rotation change")
+            except queue.Empty:
+                logging.warning(f"Main: Timeout waiting for fresh USB frame after rotation")
+            logging.debug(f"Main: Reset USB cam state, rotation now {current_cam2_rotation}, drained {drained_count} old frames from queue")
 
         # Apply rotation BEFORE processing for Pi Camera
         rotated_pi_frame = apply_rotation(pi_frame_to_process, current_cam1_rotation)
@@ -5036,4 +5148,3 @@ def add_timer_info_to_frame(frame):
 if __name__ == "__main__":
     os.environ["QT_QPA_PLATFORM"] = "xcb"
     main()
-
