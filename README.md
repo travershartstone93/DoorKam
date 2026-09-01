@@ -26,14 +26,21 @@ Runs on Linux (a spare PC or Raspberry Pi) with V4L2 USB cameras.
 ## Run it
 
 ```sh
-pip install ultralytics opencv-python flask flask-limiter flask-wtf bcrypt \
-            python-dotenv imageio numpy
-python branch14.py
+pip install -r requirements.txt
+python doorkam.py
 ```
 
 First run opens the config GUI — add cameras, users, and (optionally) email
 credentials. The dashboard then serves on the configured port; log in with the
 account you created.
 
-`branch14.py` is the current version; `branch13.py` is the previous iteration
-kept for reference.
+## Configuration
+
+- **SECRET_KEY**: set the `SECRET_KEY` env var for Flask sessions. If unset, a
+  key is generated on first run and saved to `.secret_key` (chmod 600, kept out
+  of version control).
+- **User accounts**: there are no default logins. Set `USER1_EMAIL` /
+  `USER1_PASSWORD` (and optionally `USER2_*`) or add users via the config GUI on
+  first run — until then the web dashboard has no users and login is impossible.
+- The app is deliberately a single file (`doorkam.py`): one device, one file to
+  deploy.

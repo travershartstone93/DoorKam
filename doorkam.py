@@ -5,7 +5,7 @@ Optimized for true parallelism with GIL disabled.
 
 Requirements:
     - Python 3.14+ (free-threaded build recommended)
-    - Run with: PYTHON_GIL=0 python3 branch12.py
+    - Run with: PYTHON_GIL=0 python3 doorkam.py
     - For best performance: use python3.14t if available
 """
 
@@ -15,11 +15,11 @@ import os
 import logging
 
 # Setup logging early for proper error reporting
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Python 3.14 version check
 if sys.version_info < (3, 14):
-    logging.warning(f"[WARN]  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
+    logging.warning(f"[WARN]️  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
     logging.warning("   Some features may not be available or may have reduced performance")
     logging.warning("   Install Python 3.14 for optimal performance")
 
@@ -38,9 +38,10 @@ import atexit
 import tkinter as tk
 from tkinter import ttk, messagebox
 from multiprocessing import Process, Queue, Value
-from flask import Flask, Response, render_template_string, request, redirect, url_for, session, flash, send_file
+from flask import Flask, Response, render_template_string, request, redirect, url_for, session, flash, send_from_directory
 from flask_limiter import Limiter
-from flask_wtf import FlaskForm
+from flask_limiter.util import get_remote_address
+from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import DataRequired, Email
 import bcrypt
@@ -54,6 +55,7 @@ import random
 import multiprocessing
 import queue
 import re
+import secrets
 from ultralytics import YOLO  # For YOLOv11 with segmentation
 
 # Python 3.14+ specific imports for modern features
@@ -66,7 +68,6 @@ from collections import deque
 from functools import wraps
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-from enum import Enum, auto
 
 # Python 3.14 specific: Check for subinterpreters (PEP 734)
 SUBINTERPRETERS_AVAILABLE = False
@@ -86,9 +87,9 @@ elif os.getenv('PYTHON_GIL') == '0':
 # Log Python 3.14 capabilities
 if sys.version_info >= (3, 14):
     if GIL_DISABLED:
-        logging.info("deg Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
+        logging.info("🚀 Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
     else:
-        logging.warning("[WARN]  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
+        logging.warning("[WARN]️  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
 
     if SUBINTERPRETERS_AVAILABLE:
         logging.info("[OK] Subinterpreters available (PEP 734)")
@@ -104,8 +105,6 @@ MIN_CONTOUR_AREA = 100  # Pixels (reduced from 500 for low-contrast detection)
 MIN_RECORDING_DURATION = 10  # Seconds
 ROTATION_COOLDOWN = 0.5  # Seconds
 FRAME_QUEUE_SIZE = 30  # Frames - increased from 10 to reduce dropped frames under load
-YOLO_ROI_TIMEOUT = 5.0  # Seconds - timeout for ROI YOLO analysis
-YOLO_FULL_FRAME_TIMEOUT = 10.0  # Seconds - timeout for full frame YOLO analysis
 
 # ============================================================================
 # PYTHON 3.14: Type-Safe Configuration Classes
@@ -381,404 +380,7 @@ class AppConfig:
             logging.error(f"Invalid JSON in config file: {e}")
             return cls()
 
-
 # ============================================================================
-# NEW ARCHITECTURE: State Machine and Manager Classes  
-# ============================================================================
-
-class DetectionState(Enum):
-    """State machine for detection flow"""
-    IDLE = auto()
-    MOTION_DETECTED = auto()
-    MOTION_CONFIRMED = auto()
-    YOLO_ROI = auto()
-    YOLO_FULL = auto()
-    RECORDING = auto()
-    COOLDOWN = auto()
-
-@dataclass
-class DetectionStateManager:
-    """Manages detection state transitions with proper timing"""
-    state: DetectionState = DetectionState.IDLE
-    motion_start_time: Optional[float] = None
-    motion_confirmed_time: Optional[float] = None
-    roi_yolo_start_time: Optional[float] = None
-    full_yolo_start_time: Optional[float] = None
-    recording_start_time: Optional[float] = None
-    cooldown_start_time: Optional[float] = None
-    
-    motion_confirmation_duration: float = 1.0
-    roi_yolo_timeout: float = 5.0
-    full_yolo_timeout: float = 10.0
-    cooldown_duration: float = 300.0
-    
-    roi_detected_person: bool = False
-    full_frame_detected_person: bool = False
-    source_camera: Optional[str] = None
-    
-    def transition_to(self, new_state: DetectionState) -> bool:
-        """Safely transition to new state"""
-        current_time = time.time()
-        
-        valid_transitions = {
-            DetectionState.IDLE: [DetectionState.MOTION_DETECTED],
-            DetectionState.MOTION_DETECTED: [DetectionState.MOTION_CONFIRMED, DetectionState.IDLE],
-            DetectionState.MOTION_CONFIRMED: [DetectionState.YOLO_ROI, DetectionState.IDLE],
-            DetectionState.YOLO_ROI: [DetectionState.YOLO_FULL, DetectionState.IDLE],
-            DetectionState.YOLO_FULL: [DetectionState.RECORDING, DetectionState.IDLE],
-            DetectionState.RECORDING: [DetectionState.COOLDOWN],
-            DetectionState.COOLDOWN: [DetectionState.IDLE]
-        }
-        
-        if new_state not in valid_transitions.get(self.state, []):
-            logging.warning(f"Invalid state transition: {self.state} -> {new_state}")
-            return False
-        
-        logging.info(f"State: {self.state.name} -> {new_state.name}")
-        
-        if new_state == DetectionState.MOTION_DETECTED:
-            self.motion_start_time = current_time
-        elif new_state == DetectionState.MOTION_CONFIRMED:
-            self.motion_confirmed_time = current_time
-        elif new_state == DetectionState.YOLO_ROI:
-            self.roi_yolo_start_time = current_time
-            self.roi_detected_person = False
-        elif new_state == DetectionState.YOLO_FULL:
-            self.full_yolo_start_time = current_time
-            self.full_frame_detected_person = False
-        elif new_state == DetectionState.RECORDING:
-            self.recording_start_time = current_time
-        elif new_state == DetectionState.COOLDOWN:
-            self.cooldown_start_time = current_time
-        elif new_state == DetectionState.IDLE:
-            self.reset()
-        
-        self.state = new_state
-        return True
-    
-    def reset(self):
-        """Reset state variables"""
-        global yolo_annotated_pi_frame, yolo_annotated_usb_frame
-
-        self.motion_start_time = None
-        self.motion_confirmed_time = None
-        self.roi_yolo_start_time = None
-        self.full_yolo_start_time = None
-        self.recording_start_time = None
-        self.roi_detected_person = False
-        self.full_frame_detected_person = False
-        self.source_camera = None
-
-        # BUGFIX: Clear YOLO annotated frames to prevent reuse across detection events
-        yolo_annotated_pi_frame = None
-        yolo_annotated_usb_frame = None
-    
-    def check_timeout(self, current_time: float) -> bool:
-        """Check timeouts, return True if timeout occurred"""
-        if self.state == DetectionState.MOTION_DETECTED:
-            if self.motion_start_time and (current_time - self.motion_start_time) >= 3.0:
-                self.transition_to(DetectionState.IDLE)
-                return True
-        elif self.state == DetectionState.YOLO_ROI:
-            if self.roi_yolo_start_time and (current_time - self.roi_yolo_start_time) >= self.roi_yolo_timeout:
-                logging.warning(f"ROI YOLO timeout ({self.roi_yolo_timeout}s)")
-                self.transition_to(DetectionState.IDLE)
-                return True
-        elif self.state == DetectionState.YOLO_FULL:
-            if self.full_yolo_start_time and (current_time - self.full_yolo_start_time) >= self.full_yolo_timeout:
-                logging.warning(f"Full frame YOLO timeout ({self.full_yolo_timeout}s)")
-                self.transition_to(DetectionState.IDLE)
-                return True
-        elif self.state == DetectionState.COOLDOWN:
-            if self.cooldown_start_time and (current_time - self.cooldown_start_time) >= self.cooldown_duration:
-                self.transition_to(DetectionState.IDLE)
-                return True
-        return False
-
-# ============================================================================
-
-@dataclass
-class RotationManager:
-    """Unifies all 4 rotation systems into single source of truth"""
-    cam1_display: int = 0
-    cam2_display: int = 0
-    cam1_email_override: Optional[int] = None
-    _cam1_mp_value: Optional[any] = None
-    _cam2_mp_value: Optional[any] = None
-    _email_mp_value: Optional[any] = None
-    web_sessions: Dict[str, Tuple[int, int]] = field(default_factory=dict)
-    last_change_time: float = 0.0
-    rotation_cooldown: float = 0.5
-    
-    def __post_init__(self):
-        import multiprocessing
-        if self._cam1_mp_value is None:
-            self._cam1_mp_value = multiprocessing.Value('i', self.cam1_display)
-        if self._cam2_mp_value is None:
-            self._cam2_mp_value = multiprocessing.Value('i', self.cam2_display)
-        if self._email_mp_value is None:
-            self._email_mp_value = multiprocessing.Value('i', self.cam1_email_override or self.cam1_display)
-    
-    def set_cam1_display(self, rotation: int) -> bool:
-        if not self._validate_rotation(rotation) or not self._check_cooldown():
-            return False
-        self.cam1_display = rotation
-        with self._cam1_mp_value.get_lock():
-            self._cam1_mp_value.value = rotation
-        if self.cam1_email_override is None:
-            with self._email_mp_value.get_lock():
-                self._email_mp_value.value = rotation
-        self.last_change_time = time.time()
-        logging.info(f"Camera 1 rotation set to {rotation}deg")
-        return True
-    
-    def set_cam2_display(self, rotation: int) -> bool:
-        if not self._validate_rotation(rotation) or not self._check_cooldown():
-            return False
-        self.cam2_display = rotation
-        with self._cam2_mp_value.get_lock():
-            self._cam2_mp_value.value = rotation
-        self.last_change_time = time.time()
-        logging.info(f"Camera 2 rotation set to {rotation}deg")
-        return True
-    
-    def _validate_rotation(self, rotation: int) -> bool:
-        if rotation not in [0, 90, 180, 270]:
-            logging.error(f"Invalid rotation: {rotation}")
-            return False
-        return True
-    
-    def _check_cooldown(self) -> bool:
-        return time.time() - self.last_change_time >= self.rotation_cooldown
-    
-    @property
-    def cam1_rotation(self):
-        return self._cam1_mp_value
-    
-    @property
-    def cam2_rotation(self):
-        return self._cam2_mp_value
-    
-    @property
-    def email_rotation_cam1(self):
-        return self._email_mp_value
-
-@dataclass
-class FrameBuffer:
-    """Frame pipeline for a single camera"""
-    raw: Optional[any] = None
-    rotated: Optional[any] = None
-    processed: Optional[any] = None
-    yolo_annotated: Optional[any] = None
-    previous: Optional[any] = None
-    
-    def get_display_frame(self):
-        """Get best frame for display (priority: YOLO > processed > rotated > raw)"""
-        return self.yolo_annotated or self.processed or self.rotated or self.raw
-
-@dataclass
-class FrameManager:
-    """Unified frame management for both cameras"""
-    cam1: FrameBuffer = field(default_factory=FrameBuffer)
-    cam2: FrameBuffer = field(default_factory=FrameBuffer)
-    cam1_blank: Optional[any] = None
-    cam2_blank: Optional[any] = None
-    
-    def initialize_blanks(self, cam1_resolution: Tuple[int, int], cam2_resolution: Tuple[int, int]):
-        import numpy as np
-        self.cam1_blank = np.zeros((cam1_resolution[1], cam1_resolution[0], 3), dtype=np.uint8)
-        self.cam2_blank = np.zeros((cam2_resolution[1], cam2_resolution[0], 3), dtype=np.uint8)
-    
-    def get_camera(self, camera_name: str) -> FrameBuffer:
-        return self.cam1 if camera_name == "cam1" else self.cam2
-    
-    def get_blank(self, camera_name: str):
-        return self.cam1_blank if camera_name == "cam1" else self.cam2_blank
-
-@dataclass
-class YOLOFuture:
-    """Track YOLO future with metadata"""
-    future: any  # concurrent.futures.Future
-    stage: str  # "roi" or "full_frame"
-    camera: str  # "cam1" or "cam2"
-    submission_time: float
-    frame_shape: Tuple[int, int, int]  # Shape of submitted frame
-
-@dataclass
-class YOLOManager:
-    """Manages two-stage YOLO with proper future tracking"""
-    pending: List[YOLOFuture] = field(default_factory=list)
-    processor: Optional[any] = None  # ParallelYOLOProcessor
-    last_submission_time: float = 0.0
-    submission_interval: float = 1.5
-    
-    def can_submit(self, current_time: float) -> bool:
-        """Check if enough time has passed since last submission"""
-        return (current_time - self.last_submission_time) >= self.submission_interval
-    
-    def submit_roi(self, frame, camera: str, roi_coords: Tuple[int, int, int, int], current_time: float) -> Optional[YOLOFuture]:
-        """Submit ROI for YOLO analysis"""
-        if not self.can_submit(current_time) or self.processor is None:
-            return None
-        
-        x, y, w, h = roi_coords
-        roi_frame = frame[y:y+h, x:x+w].copy()
-        
-        future = self.processor.process_frame_async(roi_frame, camera, current_time)
-        yolo_future = YOLOFuture(
-            future=future,
-            stage="roi",
-            camera=camera,
-            submission_time=current_time,
-            frame_shape=roi_frame.shape
-        )
-        
-        self.pending.append(yolo_future)
-        self.last_submission_time = current_time
-        logging.info(f"Submitted ROI frame ({w}x{h}) from {camera} to YOLO")
-        return yolo_future
-    
-    def submit_full_frame(self, frame, camera: str, current_time: float) -> Optional[YOLOFuture]:
-        """Submit full frame for YOLO verification"""
-        if self.processor is None:
-            return None
-        
-        future = self.processor.process_frame_async(frame, camera, current_time)
-        yolo_future = YOLOFuture(
-            future=future,
-            stage="full_frame",
-            camera=camera,
-            submission_time=current_time,
-            frame_shape=frame.shape
-        )
-        
-        self.pending.append(yolo_future)
-        self.last_submission_time = 0  # Allow immediate next submission if needed
-        logging.info(f"Submitted FULL frame from {camera} to YOLO")
-        return yolo_future
-    
-    def process_results(self, state_mgr: DetectionStateManager) -> Optional[Tuple[str, bool, any]]:
-        """Process completed futures, returns (stage, contains_objects, annotated_frame) if done"""
-        completed = []
-        
-        for yf in self.pending[:]:
-            if yf.future.done():
-                try:
-                    result = yf.future.result(timeout=0.1)
-                    completed.append((yf, result))
-                    self.pending.remove(yf)
-                except Exception as e:
-                    logging.error(f"YOLO future error: {e}")
-                    self.pending.remove(yf)
-        
-        # Process in order of submission
-        for yf, result in completed:
-            contains_objects, annotated_frame, processing_time = result
-            
-            if yf.stage == "roi":
-                if contains_objects:
-                    logging.info(f"[OK] Person detected in ROI on {yf.camera.upper()} ({processing_time:.2f}s)")
-                    state_mgr.roi_detected_person = True
-                    return ("roi", True, annotated_frame)
-                else:
-                    logging.debug(f"No person in ROI on {yf.camera.upper()}")
-            
-            elif yf.stage == "full_frame":
-                if contains_objects:
-                    logging.info(f"[OK] Person CONFIRMED in full frame on {yf.camera.upper()} ({processing_time:.2f}s)")
-                    state_mgr.full_frame_detected_person = True
-                    return ("full_frame", True, annotated_frame)
-                else:
-                    logging.warning(f"ROI had person but full frame verification failed on {yf.camera.upper()}")
-                    return ("full_frame", False, None)
-        
-        return None
-
-@dataclass
-class RecordingManager:
-    """Manages video recording with proper frame synchronization"""
-    active: bool = False
-    start_time: Optional[float] = None
-    video_writer: Optional[any] = None
-    temp_video_path: Optional[str] = None
-    detected_frame: Optional[any] = None
-    source_camera: str = "cam1"
-    duration: float = 10.0
-    resolution: Tuple[int, int] = (640, 480)
-    
-    def start(self, frame, camera: str, resolution: Tuple[int, int], current_time: float) -> bool:
-        """Start recording with synchronized frame"""
-        if self.active:
-            logging.warning("Recording already active")
-            return False
-        
-        import tempfile
-        
-        self.detected_frame = frame.copy()
-        self.source_camera = camera
-        self.resolution = resolution
-        self.start_time = current_time
-        
-        # Create temp video file
-        temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-        self.temp_video_path = temp_file.name
-        temp_file.close()
-        
-        # Create video writer
-        self.video_writer = cv2.VideoWriter(
-            self.temp_video_path,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            30,
-            resolution
-        )
-        
-        if not self.video_writer.isOpened():
-            logging.error(f"Failed to open video writer: {self.temp_video_path}")
-            return False
-        
-        self.active = True
-        logging.info(f"Started recording from {camera} to {self.temp_video_path}")
-        return True
-    
-    def write_frame(self, frame) -> bool:
-        """Write frame to video"""
-        if not self.active or self.video_writer is None:
-            return False
-        
-        # Resize frame if needed
-        if frame.shape[1] != self.resolution[0] or frame.shape[0] != self.resolution[1]:
-            frame = cv2.resize(frame, self.resolution)
-        
-        self.video_writer.write(frame)
-        return True
-    
-    def should_stop(self, current_time: float) -> bool:
-        """Check if recording duration has elapsed"""
-        if not self.active or self.start_time is None:
-            return False
-        return (current_time - self.start_time) >= self.duration
-    
-    def stop(self) -> Optional[str]:
-        """Stop recording and return video path"""
-        if not self.active:
-            return None
-        
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-        
-        video_path = self.temp_video_path
-        actual_duration = time.time() - self.start_time if self.start_time else 0
-        
-        logging.info(f"Stopped recording (duration: {actual_duration:.2f}s)")
-        
-        # Reset state
-        self.active = False
-        self.start_time = None
-        self.temp_video_path = None
-        
-        return video_path
-
 # PYTHON 3.14: Lock-Free Data Structures
 # ============================================================================
 
@@ -1236,14 +838,6 @@ perf_metrics = PerformanceMetrics()
 cam1_state = AtomicCameraState()
 cam2_state = AtomicCameraState()
 
-# NEW ARCHITECTURE: Global Manager Instances
-state_manager = DetectionStateManager()
-rotation_manager = RotationManager()
-frame_manager = FrameManager()
-yolo_manager = YOLOManager()
-recording_manager = RecordingManager()
-
-
 # ============================================================================
 
 # ============================================================================
@@ -1253,11 +847,7 @@ recording_manager = RecordingManager()
 # Application state
 live_feed_url = None
 streaming_active = False
-# Detection control - two separate flags with distinct purposes:
-# - detection_active: Controls whether motion detection processing runs (can be temporarily disabled during YOLO/recording)
-# - email_armed: User-facing armed/disarmed state (controls whether emails are sent when motion confirmed)
-# These serve different purposes and are intentionally separate. detection_active is an internal processing flag,
-# while email_armed is the user-controlled arming state.
+recording = False
 detection_active = True
 detection_camera = "cam1"
 pipeline_process = None
@@ -1267,21 +857,17 @@ pipeline_process = None
 frame_queue = LockFreeQueue(maxsize=FRAME_QUEUE_SIZE)
 usb_frame_queue = multiprocessing.Queue(maxsize=FRAME_QUEUE_SIZE)  # Must use multiprocessing.Queue for subprocess
 
-# Camera rotation state (NOW MANAGED BY rotation_manager for single source of truth)
-# These are kept for backwards compatibility - they reference rotation_manager's multiprocessing values
-cam1_rotation = rotation_manager.cam1_rotation
-cam2_rotation = rotation_manager.cam2_rotation
-email_rotation_cam1 = rotation_manager.email_rotation_cam1
-
+# Camera rotation state (kept as multiprocessing.Value for cross-process compatibility)
+cam1_rotation = multiprocessing.Value('i', 0)  # 0, 90, 180, 270 - rotation for camera 1
+cam2_rotation = multiprocessing.Value('i', 0)  # 0, 90, 180, 270 - rotation for camera 2
+email_rotation_cam1 = multiprocessing.Value('i', 0)  # 0, 90, 180, 270 - for emailed images
 cam2_available = multiprocessing.Value('b', False)  # Flag to indicate USB camera availability
 
 # Email control
-# Email armed state (see detection_active above for relationship)
 email_armed = True
 cooldown_active = False
 button_visible = False
 last_email_time = 0
-last_rotation_time = 0
 
 # Timer variables for scheduled arming/disarming
 timer_enabled = False
@@ -1317,8 +903,25 @@ yolo_processor: Optional[ParallelYOLOProcessor] = None  # New parallel processor
 yolo_model = None  # Legacy - will be removed after migration
 
 # YOLO analysis state
+yolo_analysis_active = False
+yolo_analysis_start_time = None
+yolo_timeout = 10
+yolo_detected_object = False
 yolo_annotated_pi_frame = None
 yolo_annotated_usb_frame = None
+
+# PYTHON 3.14: YOLO futures for async processing
+yolo_pending_futures = []  # Store futures from ParallelYOLOProcessor
+yolo_last_submission_time = 0
+YOLO_SUBMISSION_INTERVAL = 1.5
+
+# Two-stage YOLO verification
+YOLO_ROI_TIMEOUT = 5.0  # Seconds for ROI analysis
+YOLO_FULL_FRAME_TIMEOUT = 10.0  # Seconds for full frame analysis
+yolo_stage = None  # Values: None, "roi", "full_frame"
+roi_yolo_start_time = 0.0
+full_frame_yolo_start_time = 0.0
+roi_yolo_detected_person = False
 
 # Motion detection tracking
 motion_source_camera = "cam1"  # Default to cam1
@@ -1397,9 +1000,11 @@ def load_config():
         "live_feed_url": os.getenv('LIVE_FEED_URL', f"http://{local_ip}:5000/login"),
         "flask_host": os.getenv('FLASK_HOST', "0.0.0.0"),
         "flask_port": int(os.getenv('FLASK_PORT', 5000)),
+        # No default accounts - users only exist when explicitly configured via env vars
         "users": [
-            {"email": os.getenv('USER1_EMAIL', "user1@example.com"), "password_hash": bcrypt.hashpw(os.getenv('USER1_PASSWORD', "password1").encode('utf-8'), bcrypt.gensalt()).decode('utf-8')},
-            {"email": os.getenv('USER2_EMAIL', "user2@example.com"), "password_hash": bcrypt.hashpw(os.getenv('USER2_PASSWORD', "password2").encode('utf-8'), bcrypt.gensalt()).decode('utf-8')}
+            {"email": os.getenv(f'USER{n}_EMAIL'), "password_hash": bcrypt.hashpw(os.getenv(f'USER{n}_PASSWORD').encode('utf-8'), bcrypt.gensalt()).decode('utf-8')}
+            for n in (1, 2)
+            if os.getenv(f'USER{n}_EMAIL') and os.getenv(f'USER{n}_PASSWORD')
         ],
         "sender_email": os.getenv('SENDER_EMAIL', ""),
         "receiver_emails": [os.getenv('RECEIVER_EMAIL1', ""), os.getenv('RECEIVER_EMAIL2', "")],
@@ -1548,7 +1153,7 @@ def cleanup(signum=None, frame=None):
     Enhanced cleanup function with guaranteed resource release.
     Called by signal handlers and atexit to ensure proper shutdown.
     """
-    global pipeline_process, cap, yolo_processor, usb_process
+    global pipeline_process, cap, yolo_processor, usb_capture_process
 
     # Prevent duplicate cleanup if called multiple times
     if hasattr(cleanup, '_already_called'):
@@ -1567,17 +1172,17 @@ def cleanup(signum=None, frame=None):
             logging.error(f"Error shutting down YOLO processor: {str(e)}")
 
     # Safely terminate USB camera process
-    if 'usb_process' in globals() and usb_process is not None:
+    if 'usb_capture_process' in globals() and usb_capture_process is not None:
         try:
             logging.debug("Attempting to terminate USB camera process...")
-            usb_process.terminate()
+            usb_capture_process.terminate()
             try:
-                usb_process.join(timeout=3)
+                usb_capture_process.join(timeout=3)
                 logging.debug("USB camera process terminated gracefully")
             except Exception:
                 logging.debug("USB camera process didn't join, forcing kill...")
-                usb_process.kill()
-                usb_process.join(timeout=1)
+                usb_capture_process.kill()
+                usb_capture_process.join(timeout=1)
                 logging.debug("USB camera process killed")
         except Exception as e:
             logging.error(f"Error during USB camera process cleanup: {str(e)}")
@@ -1638,9 +1243,31 @@ atexit.register(cleanup)  # Guaranteed cleanup on normal exit
 
 # Flask setup
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'default-secret-key')
-app.config['SESSION_TYPE'] = 'filesystem'
-limiter = Limiter(app, default_limits=["5 per minute"], storage_uri="memory://")
+
+def load_or_create_secret_key():
+    """Use SECRET_KEY from the environment, or generate one and persist it to .secret_key
+    (chmod 600, gitignored) so sessions survive restarts without a hardcoded default."""
+    secret_key = os.getenv('SECRET_KEY')
+    if secret_key:
+        return secret_key
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key')
+    try:
+        with open(key_file, 'r') as f:
+            key = f.read().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    with open(key_file, 'w') as f:
+        f.write(key)
+    os.chmod(key_file, 0o600)
+    logging.info(f"No SECRET_KEY env var set - generated a new secret key and saved it to {key_file}")
+    return key
+
+app.config['SECRET_KEY'] = load_or_create_secret_key()
+limiter = Limiter(key_func=get_remote_address, app=app, default_limits=["5 per minute"], storage_uri="memory://")
+csrf = CSRFProtect(app)
 
 class LoginForm(FlaskForm):
     email = StringField('Email', validators=[DataRequired(), Email()])
@@ -1717,6 +1344,15 @@ def usb_camera_process(usb_queue, rotation_value, cam2_available, cam2_resolutio
     frame_interval = 1 / 30  # Target 30 FPS for smoother display
     last_frame_time = time.time()
 
+    # Store the stable rotation to avoid flickering
+    stable_rotation = 0
+    with rotation_value.get_lock():
+        stable_rotation = rotation_value.value
+
+    # Store the rotation update time to limit frequency of rotation changes
+    last_rotation_update = time.time()
+    ROTATION_UPDATE_DELAY = 1.0  # Only update rotation every 1 second max
+
     # Main loop with reconnection resilience
     while True:
         current_time = time.time()
@@ -1745,10 +1381,21 @@ def usb_camera_process(usb_queue, rotation_value, cam2_available, cam2_resolutio
             time.sleep(0.001)
             continue
 
+        # Check if we should update the stable rotation (limited by time)
+        if current_time - last_rotation_update > ROTATION_UPDATE_DELAY:
+            with rotation_value.get_lock():
+                new_rotation = rotation_value.value
+                # Only accept rotation changes in 90 degree increments
+                if abs(new_rotation - stable_rotation) >= 90:
+                    stable_rotation = new_rotation
+                    last_rotation_update = current_time
+                    logging.info(f"USB camera rotation stabilized at {stable_rotation}deg")
+
         # Try to read frame
         ret, frame = usb_cam.read()
         if ret and frame is not None:
-            # Rotation is now handled in main loop, not here
+            # Always use the stable rotation value
+            frame = apply_rotation(frame, stable_rotation)
             if not usb_queue.full():
                 usb_queue.put(frame)
             last_frame_time = current_time
@@ -1890,23 +1537,20 @@ def generate_thumbnail(src_path, dest_path, is_video=False):
     except Exception as e:
         logging.error(f"Error generating thumbnail for {src_path}: {e}")
 
-def save_media_to_storage(image, video_path, camera):
-    """Save media to storage with rotation based on camera source"""
+def save_media_to_storage(image, video_path):
+    """PYTHON 3.14: Lock-free media storage - filesystem operations are atomic"""
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
 
+    # PYTHON 3.14: No media_lock needed - filesystem operations are atomic
     os.makedirs("stored_media", exist_ok=True)
     image_path = f"stored_media/{timestamp}_image.jpg"
     video_dest_path = f"stored_media/{timestamp}_video.mp4"
     thumbnail_image_path = f"stored_media/{timestamp}_image_thumb.jpg"
     thumbnail_video_path = f"stored_media/{timestamp}_video_thumb.jpg"
 
-    # Use appropriate rotation based on camera source
-    if camera == "cam2":
-        with cam2_rotation.get_lock():
-            rotated_image = apply_rotation(image, cam2_rotation.value)
-    else:
-        with email_rotation_cam1.get_lock():
-            rotated_image = apply_rotation(image, email_rotation_cam1.value)
+    # Keep email_rotation_cam1 lock for cross-process safety
+    with email_rotation_cam1.get_lock():
+        rotated_image = apply_rotation(image, email_rotation_cam1.value)
 
     if cv2.imwrite(image_path, rotated_image):
         logging.debug(f"Image saved: {image_path}")
@@ -1935,6 +1579,7 @@ def purge_old_media():
 
 # Flask Routes
 @app.route('/video_feed', methods=['GET', 'POST'])
+@csrf.exempt  # accepts POST from clients without a form; page only renders, no state change
 @limiter.limit("5 per minute")
 @login_required
 def video_feed():
@@ -1979,10 +1624,12 @@ def video_feed():
             </div>
             <div class="button-container">
                 <form action="{{ url_for('rotate_web_cam1') }}" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit">Rotate Camera 1</button>
                 </form>
                 {% if cam2_present %}
                 <form action="{{ url_for('rotate_web_cam2') }}" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit">Rotate Camera 2</button>
                 </form>
                 {% endif %}
@@ -2095,10 +1742,14 @@ def health():
     """
     System health endpoint with comprehensive metrics.
     Returns JSON with camera status, queue metrics, and system state.
-    Does not require authentication for monitoring purposes.
+    Does not require authentication for monitoring purposes, but only
+    logged-in users get the full payload.
     """
     import json as json_module
     from flask import jsonify
+
+    if 'user' not in session:
+        return jsonify({"status": "running"}), 200
 
     try:
         health_data = {
@@ -2233,6 +1884,7 @@ def document():
                 <div class="flash">{{ message }}</div>
             {% endfor %}
             <form method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <textarea name="content">{{ content }}</textarea>
                 <br>
                 <button type="submit">Save</button>
@@ -2282,6 +1934,7 @@ def stored_media():
             <h1>Stored Media</h1>
             <div style="text-align: center;">
                 <form action="{{ url_for('purge_media') }}" method="POST" style="display: inline-block;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit">Purge All Media</button>
                 </form>
                 <br>
@@ -2311,12 +1964,8 @@ def stored_media():
 @app.route('/media/<path:filename>')
 @login_required
 def serve_media(filename):
-    file_path = os.path.join("stored_media", filename)
-    if not os.path.exists(file_path):
-        return "File not found", 404
-    if filename.endswith('.mp4'):
-        return send_file(file_path, mimetype='video/mp4', as_attachment=False)
-    return send_file(file_path, as_attachment=False)
+    # send_from_directory refuses paths that escape stored_media (path traversal safe)
+    return send_from_directory("stored_media", filename)
 
 @app.route('/purge_media', methods=['POST'])
 @login_required
@@ -2442,18 +2091,18 @@ def yolo_worker():
 """
 
 def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtraction=True):
-    global detection_active, detection_camera, state_manager, recording_manager
+    global detection_active, detection_camera, yolo_analysis_active
     global knn_frame_counter_cam1, knn_frame_counter_cam2
 
     # Log the current state occasionally for debugging
     if random.random() < 0.001:  # Log approx. 0.1% of frames to avoid log spam
         logging.debug(f"Processing frame for {camera}, detection_camera={detection_camera}, method={'BG Subtraction' if use_bg_subtraction else 'Frame Diff'}")
     
-    # Skip processing if not active, streaming, or in YOLO/recording states
-    yolo_or_recording = state_manager.state in [DetectionState.YOLO_ROI, DetectionState.YOLO_FULL, DetectionState.RECORDING]
-    if not detection_active or streaming_active or yolo_or_recording:
+    # Skip processing if not active, streaming, recording, or YOLO analysis is active
+    if not detection_active or streaming_active or recording or yolo_analysis_active:
+        # Return previous_frame for frame diff, or None if using BG subtraction (as it's not needed)
         return_prev = previous_frame if previous_frame is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return frame, False, return_prev
+        return frame, False, return_prev, False # Added False for yolo_contains_objects
         
     # Check if the detection is enabled for this camera
     is_detection_enabled = False
@@ -2477,7 +2126,7 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
     if not is_detection_enabled:
         # Return previous_frame for frame diff, or None if using BG subtraction
         return_prev = previous_frame if previous_frame is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return frame_with_text, False, return_prev
+        return frame_with_text, False, return_prev, False # Added False for yolo_contains_objects
 
     try:
         # Use camera-specific ROI coordinates
@@ -2578,10 +2227,10 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
                 # Skip motion detection during warmup frames
                 if frame_count <= SKIP_DETECTION_FRAMES:
                     # Return no motion detected during warmup to let background model stabilize
-                    return frame_with_roi, False, None
+                    return frame_with_roi, False, None, False
             else:
                 logging.warning(f"Background subtractor for {camera} is None, cannot process.")
-                return frame_with_roi, False, None # Return None for previous_frame
+                return frame_with_roi, False, None, False # Return None for previous_frame
 
         else:
             # Use original frame differencing method
@@ -2679,8 +2328,7 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
                  logging.log(log_level, f"{camera}: Motion rejected - only {significant_contour_count} significant contours (area > {min_area_threshold:.1f}), minimum required: {min_contours_required}")
 
         # Apply motion segmentation overlay if motion is confirmed and YOLO is not active
-        yolo_active = state_manager.state in [DetectionState.YOLO_ROI, DetectionState.YOLO_FULL]
-        if motion_detected and not yolo_active and significant_contour_count > 0:
+        if motion_detected and not yolo_analysis_active and significant_contour_count > 0:
             # Use the threshold mask directly for segmentation overlay
             # Convert grayscale thresh to BGR for overlay
             thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
@@ -2701,15 +2349,15 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
 
         # Return the frame with motion boxes and detection status
         # YOLO detection will be handled separately in the main loop
-        return frame_with_roi, motion_detected, updated_previous_frame
+        return frame_with_roi, motion_detected, updated_previous_frame, False
         
     except Exception as e:
         logging.error(f"Error in process_frame for {camera}: {e}")
-        # Return potentially updated previous_frame
-        return frame_with_text, False, updated_previous_frame if 'updated_previous_frame' in locals() else previous_frame
+        # Return potentially updated previous_frame and False for YOLO
+        return frame_with_text, False, updated_previous_frame if 'updated_previous_frame' in locals() else previous_frame, False
 
-def create_gif_from_video(video_path, output_gif_path, camera, max_frames=60, fps=10):
-    """Create GIF from video with rotation based on camera source"""
+def create_gif_from_video(video_path, output_gif_path, max_frames=60, fps=10):
+    global motion_source_camera
     cap = cv2.VideoCapture(video_path)
     frames = []
     frame_count = 0
@@ -2722,15 +2370,15 @@ def create_gif_from_video(video_path, output_gif_path, camera, max_frames=60, fp
     step = max(1, total_frames // max_frames) if total_frames > max_frames else 1
     target_frames = min(total_frames, max_frames)
 
-    logging.debug(f"Creating GIF: total_frames={total_frames}, step={step}, target_frames={target_frames}, source={camera}")
+    logging.debug(f"Creating GIF: total_frames={total_frames}, step={step}, target_frames={target_frames}, source={motion_source_camera}")
 
     # Use the appropriate rotation value based on camera source
-    if camera == "cam2":
+    if motion_source_camera == "cam2":
         with cam2_rotation.get_lock():
             rotation = cam2_rotation.value
         logging.debug(f"Using Camera 2 rotation for GIF: {rotation}deg")
     else:
-        with email_rotation_cam1.get_lock():
+        with email_rotation_cam1.get_lock(): # Indent this block
             rotation = email_rotation_cam1.value
             logging.debug(f"Using Camera 1 rotation for GIF: {rotation}deg")
 
@@ -2754,9 +2402,8 @@ def create_gif_from_video(video_path, output_gif_path, camera, max_frames=60, fp
         logging.error(f"No frames extracted from {video_path}")
         raise ValueError("Failed to create GIF")
 
-def send_media_via_gmail(image, video_path, sender_email, receiver_emails, password, camera):
-    """Send email with media (camera passed as parameter for thread safety)"""
-    global last_email_time, cooldown_active
+def send_media_via_gmail(image, video_path, sender_email, receiver_emails, password):
+    global last_email_time, cooldown_active, motion_source_camera
     live_feed_url = config['live_feed_url']
     current_time = time.time()
     if current_time - last_email_time < EMAIL_COOLDOWN:
@@ -2768,12 +2415,12 @@ def send_media_via_gmail(image, video_path, sender_email, receiver_emails, passw
         return
 
     # Log which camera triggered this email
-    camera_source = "Camera 2" if camera == "cam2" else "Camera 1"
+    camera_source = "Camera 2" if motion_source_camera == "cam2" else "Camera 1"
     logging.info(f"Creating email media with source: {camera_source}")
 
     gif_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.gif')
     try:
-        create_gif_from_video(video_path, gif_temp.name, camera)
+        create_gif_from_video(video_path, gif_temp.name)
     except Exception as e:
         logging.error(f"Failed to create GIF: {type(e).__name__}: {e}")
         os.unlink(gif_temp.name)
@@ -2806,14 +2453,14 @@ def send_media_via_gmail(image, video_path, sender_email, receiver_emails, passw
         msg.attach(gif_part)
 
     # Apply appropriate rotation based on camera source
-    if camera == "cam2":
+    if motion_source_camera == "cam2":
         with cam2_rotation.get_lock():
             rotation = cam2_rotation.value
         logging.debug(f"Using Camera 2 rotation for email image: {rotation}deg")
     else:
-        with email_rotation_cam1.get_lock():
+        with email_rotation_cam1.get_lock(): # Indent this block
             rotation = email_rotation_cam1.value
-            logging.debug(f"Using Camera 1 rotation for email image: {rotation}deg")
+            logging.debug(f"Using Camera 1 rotation for email image: {rotation}deg") # Ensure this line is also correctly indented
     
     rotated_image = apply_rotation(image, rotation)
     resized_image = cv2.resize(rotated_image, (320, 240), interpolation=cv2.INTER_AREA)
@@ -2835,22 +2482,22 @@ def send_media_via_gmail(image, video_path, sender_email, receiver_emails, passw
     except smtplib.SMTPAuthenticationError:
         logging.error("SMTP Authentication failed. Check sender_email and password.")
     except smtplib.SMTPException as e:
-        logging.error(f"SMTP error: {e}")
+        logging.error(f"SMTP error: {type(e).__name__}: {e}")
     except Exception as e:
-        logging.error(f"Failed to send email: {type(e).__name__}: {e}")
+        logging.error(f"Email sending failed: {type(e).__name__}: {e}")
     finally:
         os.unlink(gif_temp.name)
 
-def send_email_in_thread(image, video_path, sender, receivers, password, camera):
-    """Send email with media in a separate thread (camera passed for thread safety)"""
-    global last_email_time, cooldown_active
+def send_email_in_thread(image, video_path, sender, receivers, password):
+    """Send email with media in a separate thread to avoid blocking the main loop"""
+    global last_email_time, cooldown_active, motion_source_camera
     try:
         # Additional logging at start of email thread
-        camera_source = "Camera 2" if camera == "cam2" else "Camera 1"
+        camera_source = "Camera 2" if motion_source_camera == "cam2" else "Camera 1"
         logging.info(f"Email thread starting for {camera_source}, image type: {type(image)}")
         
         # Extra verification for Camera 2 emails
-        if camera == "cam2":
+        if motion_source_camera == "cam2":
             logging.info(f"Camera 2 email verification: video exists={os.path.exists(video_path)}, " +
                         f"size={os.path.getsize(video_path) if os.path.exists(video_path) else 'N/A'} bytes")
         
@@ -2863,7 +2510,7 @@ def send_email_in_thread(image, video_path, sender, receivers, password, camera)
             return
             
         # Save media to storage first
-        save_media_to_storage(image, video_path, camera)
+        save_media_to_storage(image, video_path)
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         stored_video_path = f"stored_media/{timestamp}_video.mp4"
         
@@ -2871,14 +2518,145 @@ def send_email_in_thread(image, video_path, sender, receivers, password, camera)
         logging.info("Waiting briefly to ensure video file is fully written...")
         time.sleep(1)
             
-        # Verify stored video file exists and has content
-        if os.path.exists(stored_video_path) and os.path.getsize(stored_video_path) > 100:
-            send_media_via_gmail(image, stored_video_path, sender, receivers, password, camera)
-        else:
-            logging.error(f"Stored video file {stored_video_path} not found or too small, cannot send email")
+        # Proceed with email sending
+        send_media_via_gmail(image, stored_video_path, sender, receivers, password)
+        logging.info("Email thread completed successfully")
+        
+        # Update cooldown state after successful send
+        last_email_time = time.time()
+        cooldown_active = True
     except Exception as e:
-        logging.error(f"Error in email thread: {type(e).__name__}: {e}")
+        logging.error(f"Error in email thread: {e}")
+        logging.exception("Full traceback for email error:")
 
+# ToggleDialog
+class ToggleDialog(tk.Toplevel):
+    def __init__(self, root):
+        super().__init__(root)
+        self.root = root
+        
+        # Remove all window decorations
+        self.overrideredirect(True)
+        self.geometry("120x40")
+        self.attributes('-topmost', True)
+        self.withdraw()
+        
+        # Debugging setup
+        self.debug_clicks = 0
+        
+        # Create a button with a direct binding and command
+        self.toggle_button = ttk.Button(self, text="Armed" if email_armed else "Disarmed")
+        self.toggle_button.pack(fill="both", expand=True)
+        
+        # Add both command and bind
+        self.toggle_button.config(command=self.toggle_state)
+        self.toggle_button.bind("<Button-1>", self.toggle_state_event)
+        
+        self.last_click_time = time.time()
+        self.timer_thread = threading.Thread(target=self.auto_hide, daemon=True)
+        self.timer_thread.start()
+        logging.info("ToggleDialog initialized")
+
+    def toggle_state_event(self, event):
+        """Event-based handler for button clicks"""
+        logging.info("Button clicked via event binding")
+        self.toggle_state()
+        return "break"  # Prevent event propagation
+
+    def toggle_state(self):
+        """Command-based handler for button clicks"""
+        global email_armed, cooldown_active, detection_active
+        
+        # Increment debug counter
+        self.debug_clicks += 1
+        logging.info(f"Button clicked {self.debug_clicks} times - toggle_state called")
+        
+        # Check current state for better logging
+        old_email_armed = email_armed
+        old_detection_active = detection_active
+        
+        # Toggle state
+        email_armed = not email_armed
+        
+        # CRITICAL: Also update detection_active to match email_armed state
+        # This ensures that motion detection stops when disarmed
+        if detection_camera != "disable":  # If detection isn't manually disabled
+            detection_active = email_armed
+            
+        if email_armed and cooldown_active:
+            cooldown_active = False
+            logging.info("Cooldown overridden by manual arming")
+        
+        button_text = "Armed" if email_armed else "Disarmed"
+        
+        # If timer is enabled, indicate this is a manual override
+        if timer_enabled:
+            button_text += " (Manual)"
+            logging.info(f"Timer schedule manually overridden, detection {'armed' if email_armed else 'disarmed'}")
+        
+        self.toggle_button.config(text=button_text)
+        self.last_click_time = time.time()
+        logging.info(f"Toggle state changed: email_armed {old_email_armed}->{email_armed}")
+        logging.info(f"Toggle state changed: detection_active {old_detection_active}->{detection_active}")
+        logging.info(f"Detection emails {'armed' if email_armed else 'disarmed'}")
+        logging.info(f"Detection active set to: {detection_active}")
+        
+    def update_status(self):
+        """Update the button text to reflect current arm/disarm status"""
+        button_text = "Armed" if email_armed else "Disarmed"
+        
+        # If timer is enabled, check if we need to add the manual override indicator
+        if timer_enabled:
+            # Get current time in seconds since midnight
+            current_time = time.time()
+            current_time_struct = time.localtime(current_time)
+            current_seconds = current_time_struct.tm_hour * 3600 + current_time_struct.tm_min * 60 + current_time_struct.tm_sec
+            
+            # Determine what the scheduled status should be
+            scheduled_armed = False
+            if schedule_arm_seconds is not None and schedule_disarm_seconds is not None:
+                if schedule_arm_seconds < schedule_disarm_seconds:
+                    scheduled_armed = schedule_arm_seconds <= current_seconds < schedule_disarm_seconds
+                else:
+                    scheduled_armed = current_seconds >= schedule_arm_seconds or current_seconds < schedule_disarm_seconds
+            
+            # If current status differs from scheduled status, it's a manual override
+            if email_armed != scheduled_armed:
+                button_text += " (Manual)"
+        
+        self.toggle_button.config(text=button_text)
+
+    def show(self):
+        if self.winfo_exists():
+            self.deiconify()
+            self.lift()
+            global button_visible
+            button_visible = True
+            self.last_click_time = time.time()
+            logging.info("Toggle dialog shown")
+
+    def hide(self):
+        if self.winfo_exists():
+            self.withdraw()
+            global button_visible
+            button_visible = False
+            logging.info("Toggle dialog hidden")
+
+    def auto_hide(self):
+        while True:
+            try:
+                if button_visible and time.time() - self.last_click_time >= 10:
+                    # Use after() to schedule hide in the main thread
+                    self.root.after(0, self.hide)
+            except Exception as e:
+                logging.error(f"Error in auto_hide: {e}")
+            time.sleep(1)
+
+    def on_close(self):
+        if self.winfo_exists():
+            self.hide()
+
+# Toggle visibility
 def toggle_visibility(event, x, y, flags, param):
     """Mouse callback that shows/hides the toggle button interface"""
     global button_visible
@@ -2897,93 +2675,6 @@ def toggle_visibility(event, x, y, flags, param):
             logging.info("Button was not visible - showing toggle dialog")
             toggle_dialog.show()
         toggle_dialog.last_click_time = time.time()
-
-# ToggleDialog
-class ToggleDialog(tk.Toplevel):
-    def __init__(self, root):
-        super().__init__(root)
-        self.root = root
-
-        # Remove all window decorations
-        self.overrideredirect(True)
-        self.geometry("120x40")
-        self.attributes('-topmost', True)
-        self.withdraw()
-
-        # Just a single button
-        self.toggle_button = ttk.Button(self, text="Armed" if email_armed else "Disarmed", command=self.toggle_state)
-        self.toggle_button.pack(fill="both", expand=True)
-
-        self.last_click_time = time.time()
-        self.timer_thread = threading.Thread(target=self.auto_hide, daemon=True)
-        self.timer_thread.start()
-        logging.info("ToggleDialog initialized")
-
-    def toggle_state(self):
-        global email_armed, cooldown_active, detection_active
-        email_armed = not email_armed
-        detection_active = email_armed
-        if email_armed and cooldown_active:
-            cooldown_active = False
-            logging.info("Cooldown overridden by manual arming")
-        self.toggle_button.config(text="Armed" if email_armed else "Disarmed")
-        self.last_click_time = time.time()
-        logging.info(f"Detection emails {'armed' if email_armed else 'disarmed'}")
-        logging.info(f"Detection active also set to: {detection_active}")
-
-    def show(self):
-        if self.winfo_exists():
-            self.deiconify()
-            self.lift()
-            global button_visible
-            button_visible = True
-            self.last_click_time = time.time()
-
-    def hide(self):
-        if self.winfo_exists():
-            self.withdraw()
-            global button_visible
-            button_visible = False
-
-    def auto_hide(self):
-        while True:
-            try:
-                if button_visible and time.time() - self.last_click_time >= 10:
-                    # Use after() to schedule hide in the main thread
-                    self.root.after(0, self.hide)
-            except Exception as e:
-                logging.error(f"Error in auto_hide: {e}")
-            time.sleep(1)
-
-    def on_close(self):
-        if self.winfo_exists():
-            self.hide()
-
-    def update_status(self):
-        """Update the toggle dialog to reflect current camera and detection status"""
-        global email_armed, cooldown_active, detection_camera
-
-        # Check if Camera 2 is available
-        with cam2_available.get_lock():
-            cam2_is_available = cam2_available.value
-
-        # If Camera 2 is not available and detection is set to cam2 or both,
-        # reset to cam1
-        if not cam2_is_available and detection_camera in ['cam2', 'both']:
-            detection_camera = 'cam1'
-            logging.info("Reset detection camera to 'cam1' in ToggleDialog since Camera 2 is unavailable")
-
-            # Update global config to match
-            config['detection_camera'] = 'cam1'
-            try:
-                with open(CONFIG_FILE, 'w') as f:
-                    json.dump(config, f, indent=4)
-                logging.info("Updated config file with new detection camera setting")
-            except Exception as e:
-                logging.error(f"Failed to update config file: {e}")
-
-        # Update button text
-        self.toggle_button.config(text="Armed" if email_armed else "Disarmed")
 
 # SettingsDialog
 class SettingsDialog(tk.Toplevel):
@@ -3284,7 +2975,9 @@ class SettingsDialog(tk.Toplevel):
         self.roi_status_label.pack_forget()  # Hide initially
 
         ttk.Button(scrollable_frame, text="Rotate Camera 1", command=self.rotate_cam1).pack(pady=5)
-        ttk.Button(scrollable_frame, text="Rotate Camera 2", command=self.rotate_cam2).pack(pady=5)
+        with cam2_available.get_lock():
+            if cam2_available.value:
+                ttk.Button(scrollable_frame, text="Rotate Camera 2", command=self.rotate_cam2).pack(pady=5)
 
         ttk.Label(scrollable_frame, textvariable=self.email_rotation_label).pack(pady=5)
         ttk.Button(scrollable_frame, text="Rotate Email", command=self.rotate_email).pack(pady=5)
@@ -4045,26 +3738,32 @@ def main():
     global streaming_active, recording, detection_active, pipeline_process, cam1_rotation, cam2_rotation
     global cam2_available, email_rotation_cam1, screen_width, screen_height, last_cam1_rotation, last_cam2_rotation
     global last_rotation_time, email_armed, button_visible, config, authorized_users, last_email_time, cooldown_active
-    global usb_frame_queue
     global cap, toggle_dialog, settings_dialog, detection_camera, motion_source_camera
+    global motion_detection_time_cam1, motion_detection_time_cam2, pending_roi_activation, pending_ui_update
+    global bg_subtractor_cam1, bg_subtractor_cam2, last_timer_check
+    global yolo_analysis_active, yolo_analysis_start_time, yolo_detected_object
     # PYTHON 3.14: Removed old YOLO worker globals (yolo_worker_thread, yolo_worker_running, yolo_request_queue, yolo_response_queue)
+    global yolo_last_submission_time, yolo_pending_futures
     global yolo_annotated_pi_frame, yolo_annotated_usb_frame
-    global roi_selection_mode, roi_temp, pending_roi_activation, pending_ui_update
+    global roi_selection_mode, roi_temp
 
     root = tk.Tk()
     root.withdraw()
 
+    detection_start_time = None
     video_writer = temp_video_file = None
     pi_previous_frame = None  # Keep for frame differencing method
-    usb_previous_frame = None  # Keep for frame differencing method
-    detection_check_start = None  # Track detection timing
+    usb_previous_frame = None # Keep for frame differencing method
+    minimum_recording_duration = MIN_RECORDING_DURATION
+    detected_image = None
+    detection_delay = detection_check_start = None
+    is_detected = False
     # Initialize last_timer_check
     last_timer_check = time.time()
 
     # Load config at start of main
     load_config()
     logging.debug(f"Config after initial load in main: {type(config)}, {config}")
-    
     
     # PYTHON 3.14: YOLO processor is now initialized in load_config_modern()
     # Old worker thread initialization removed - using ParallelYOLOProcessor instead
@@ -4073,28 +3772,6 @@ def main():
         logging.info("YOLO object detection enabled (using ParallelYOLOProcessor)")
     else:
         logging.info("YOLO object detection disabled in config")
-
-    # NEW ARCHITECTURE: Initialize managers
-    # Initialize frame manager with blank frames
-    cam1_res_str = config.get('cam1_resolution', '640x480')
-    cam2_res_str = config.get('cam2_resolution', '1280x720')
-    cam1_w, cam1_h = map(int, cam1_res_str.split('x'))
-    cam2_w, cam2_h = map(int, cam2_res_str.split('x'))
-    frame_manager.initialize_blanks(
-        cam1_resolution=(cam1_w, cam1_h),
-        cam2_resolution=(cam2_w, cam2_h)
-    )
-    
-    # Wire YOLO processor to yolo_manager
-    yolo_manager.processor = yolo_processor
-    
-    # Set state_manager timeouts from config
-    state_manager.roi_yolo_timeout = YOLO_ROI_TIMEOUT
-    state_manager.full_yolo_timeout = YOLO_FULL_FRAME_TIMEOUT
-    state_manager.cooldown_duration = EMAIL_COOLDOWN
-    
-    logging.info("NEW ARCHITECTURE: All managers initialized successfully")
-
 
     # Initialize rotation tracking variables
     last_cam1_rotation = 0
@@ -4137,6 +3814,11 @@ def main():
     #     logging.error(f"Failed to save reset ROI coordinates: {e}")
     
     authorized_users.update({user["email"]: user["password_hash"].encode('utf-8') for user in config["users"]})
+    if not authorized_users:
+        logging.warning("=" * 70)
+        logging.warning("NO WEB DASHBOARD USERS CONFIGURED - login is impossible until you set")
+        logging.warning("USER1_EMAIL/USER1_PASSWORD env vars (or add users to config.json)")
+        logging.warning("=" * 70)
     sender_email = config['sender_email']
     receiver_emails = config['receiver_emails']
     email_password = config['email_password']
@@ -4235,9 +3917,7 @@ def main():
     except ValueError:
         cam2_res_w, cam2_res_h = 320, 240 # Fallback resolution
     last_usb_frame = np.zeros((cam2_res_h, cam2_res_w, 3), dtype=np.uint8) # Initialize blank USB frame
-    last_usb_frame_raw = last_usb_frame.copy()  # Initialize raw frame buffer
-    last_pi_frame_raw = last_pi_frame.copy()  # Initialize raw pi frame buffer
-    processed_pi_frame = last_pi_frame.copy()  # Initialize processed frames
+    processed_pi_frame = last_pi_frame.copy()  # Initialize processed frames 
     processed_usb_frame = last_usb_frame.copy() # Initialize processed frames
 
     frame_interval = 1 / 30
@@ -4317,9 +3997,6 @@ def main():
         ret = False
         if cap and cap.isOpened():
             ret, pi_frame = cap.read()
-            # Store raw frame to avoid compound rotation
-            if ret and pi_frame is not None:
-                last_pi_frame_raw = pi_frame.copy()
             if not ret:
                  logging.warning("Failed to grab Pi camera frame")
 
@@ -4357,7 +4034,7 @@ def main():
                              if ret_restart and frame_restart is not None:
                                  pi_camera_reconnector.record_attempt(current_time, success=True)
                                  pi_frame = frame_restart
-                                 last_pi_frame_raw = pi_frame.copy()
+                                 last_pi_frame = pi_frame.copy()
                                  logging.info("Pi camera reconnected and frame captured successfully")
                                  continue  # Process this frame
                              else:
@@ -4382,20 +4059,17 @@ def main():
                     except (AttributeError, ValueError) as e:
                        logging.debug(f"Could not get shape from last_pi_frame: {e}")
                        h, w = cam1_res_h, cam1_res_w
-                    blank_frame = np.zeros((h, w, 3), dtype=np.uint8)
-                    last_pi_frame = blank_frame
-                    last_pi_frame_raw = blank_frame.copy()
+                    last_pi_frame = np.zeros((h, w, 3), dtype=np.uint8)
                     # Continue loop - will retry based on backoff timer
 
         # Use last valid frame if current read failed but cap exists
         if pi_frame is None:
-            pi_frame_to_process = last_pi_frame_raw # Use raw frame to avoid compound rotation
+            pi_frame_to_process = last_pi_frame # Use the blank or last good frame
         else:
             # Ensure frame has correct dimensions (might be needed if pipeline restarts with different res?)
-            # BUGFIX: Compare to RAW frame, not processed frame (which may be rotated with swapped dimensions)
-            if pi_frame.shape[0] != last_pi_frame_raw.shape[0] or pi_frame.shape[1] != last_pi_frame_raw.shape[1]:
+            if pi_frame.shape[0] != last_pi_frame.shape[0] or pi_frame.shape[1] != last_pi_frame.shape[1]:
                  try:
-                     pi_frame = cv2.resize(pi_frame, (last_pi_frame_raw.shape[1], last_pi_frame_raw.shape[0]))
+                     pi_frame = cv2.resize(pi_frame, (last_pi_frame.shape[1], last_pi_frame.shape[0]))
                      logging.warning("Resized incoming Pi frame to match expected dimensions.")
                  except Exception as resize_err:
                      logging.error(f"Failed to resize Pi frame: {resize_err}. Using last good frame.")
@@ -4408,22 +4082,17 @@ def main():
         # multiprocessing.Queue: use get_nowait() which raises queue.Empty if empty
         try:
             usb_frame = usb_frame_queue.get_nowait()
-            # Store raw frame to avoid compound rotation when queue is empty
-            last_usb_frame_raw = usb_frame.copy() if usb_frame is not None else last_usb_frame_raw
         except queue.Empty:
-            # Use last raw frame (not processed/rotated) to avoid compound rotation
-            usb_frame = last_usb_frame_raw if last_usb_frame_raw is not None else last_usb_frame
-
+            usb_frame = last_usb_frame  # Use last known frame
         if usb_frame is not None:
             # Ensure frame has correct dimensions
-            # BUGFIX: Compare to RAW frame, not processed frame (which may be rotated with swapped dimensions)
-            if last_usb_frame_raw is not None and (usb_frame.shape[0] != last_usb_frame_raw.shape[0] or usb_frame.shape[1] != last_usb_frame_raw.shape[1]):
+            if usb_frame.shape[0] != last_usb_frame.shape[0] or usb_frame.shape[1] != last_usb_frame.shape[1]:
                  try:
-                    usb_frame = cv2.resize(usb_frame, (last_usb_frame_raw.shape[1], last_usb_frame_raw.shape[0]))
+                    usb_frame = cv2.resize(usb_frame, (last_usb_frame.shape[1], last_usb_frame.shape[0]))
                     logging.warning("Resized incoming USB frame to match expected dimensions.")
                  except Exception as resize_err:
                      logging.error(f"Failed to resize USB frame: {resize_err}. Using last good frame.")
-                     usb_frame = last_usb_frame_raw if last_usb_frame_raw is not None else last_usb_frame
+                     usb_frame = last_usb_frame # Fallback
 
             usb_frame_to_process = usb_frame
             # Note: last_usb_frame will be updated after process_frame() with processed version
@@ -4442,55 +4111,23 @@ def main():
             # PYTHON 3.14: Clear Pi frame queue for web feed
             while frame_queue.get() is not None:
                 pass  # Drain the queue
-            # Read a fresh frame directly from camera to update raw buffer
-            if cap and cap.isOpened():
-                ret_fresh, fresh_pi_frame = cap.read()
-                if ret_fresh and fresh_pi_frame is not None:
-                    last_pi_frame_raw = fresh_pi_frame.copy()
-                    logging.debug(f"Main: Got fresh Pi frame after rotation change")
             logging.debug(f"Main: Reset Pi cam state, rotation now {current_cam1_rotation}")
 
-        # Handle cam2 rotation - drain buffered frames immediately
-        current_cam2_rotation = 0
-        with cam2_rotation.get_lock():
-            current_cam2_rotation = cam2_rotation.value
-        if current_cam2_rotation != last_cam2_rotation:
-            usb_previous_frame = None  # Reset for frame differencing
-            bg_subtractor_cam2 = cv2.createBackgroundSubtractorKNN(detectShadows=True, dist2Threshold=400.0, history=500)  # Reset background subtractor
-            knn_frame_counter_cam2 = 0  # Reset frame counter for new warmup period
-            last_cam2_rotation = current_cam2_rotation
-            # Drain the USB queue to clear old pre-rotation frames
-            drained_count = 0
-            try:
-                while True:
-                    usb_frame_queue.get_nowait()
-                    drained_count += 1
-            except queue.Empty:
-                pass
-            # Wait for a fresh frame from the queue (timeout after 1 second)
-            try:
-                fresh_frame = usb_frame_queue.get(timeout=1.0)
-                if fresh_frame is not None:
-                    last_usb_frame_raw = fresh_frame.copy()
-                    logging.debug(f"Main: Got fresh frame after rotation change")
-            except queue.Empty:
-                logging.warning(f"Main: Timeout waiting for fresh USB frame after rotation")
-            logging.debug(f"Main: Reset USB cam state, rotation now {current_cam2_rotation}, drained {drained_count} old frames from queue")
+        # No cam2 rotation handling needed here anymore
 
         # Apply rotation BEFORE processing for Pi Camera
         rotated_pi_frame = apply_rotation(pi_frame_to_process, current_cam1_rotation)
-        # Apply rotation for USB Camera
-        rotated_usb_frame = apply_rotation(usb_frame_to_process, current_cam2_rotation)
+        # USB frame is already rotated in its process
 
         # --- Store Original Frames for YOLO ---
         # IMPORTANT: Store the original full frames BEFORE processing
         # YOLO needs to analyze the complete frame, not just the ROI
         original_pi_frame = rotated_pi_frame.copy() if rotated_pi_frame is not None else None
-        original_usb_frame = rotated_usb_frame.copy() if rotated_usb_frame is not None else None
+        original_usb_frame = usb_frame_to_process.copy() if usb_frame_to_process is not None else None
 
         # --- Process Frames ---
         # Process Camera 1 (Pi Camera) if available
-        processed_pi_frame, pi_detected, pi_previous_frame = process_frame(
+        processed_pi_frame, pi_detected, pi_previous_frame, pi_yolo_objects = process_frame(
             rotated_pi_frame,
             bg_subtractor_cam1,
             pi_previous_frame,
@@ -4499,8 +4136,8 @@ def main():
         )
 
         # Process Camera 2 (USB) if available
-        processed_usb_frame, usb_detected, usb_previous_frame = process_frame(
-            rotated_usb_frame,
+        processed_usb_frame, usb_detected, usb_previous_frame, usb_yolo_objects = process_frame(
+            usb_frame_to_process,
             bg_subtractor_cam2,
             usb_previous_frame,
             "cam2",
@@ -4514,6 +4151,10 @@ def main():
         # YOLO analysis will happen asynchronously after motion confirmation
         # Note: pi_yolo_objects and usb_yolo_objects will always be False now since
         # we removed YOLO from process_frame() - YOLO runs asynchronously instead
+        is_detected = raw_motion_detected
+
+        # Use detection_active flag to determine if motion should trigger actions
+        is_detected = is_detected and detection_active
         
         if raw_motion_detected and not detection_active:
             logging.debug("Motion detected but system is disarmed - ignoring")
@@ -4541,14 +4182,12 @@ def main():
 
         # Show YOLO annotated frames during YOLO analysis AND recording
         # Only revert to live frames after recording completes
-        yolo_or_rec = state_manager.state in [DetectionState.YOLO_ROI, DetectionState.YOLO_FULL, DetectionState.RECORDING]
-        if yolo_or_rec and yolo_annotated_pi_frame is not None:
+        if (yolo_analysis_active or recording) and yolo_annotated_pi_frame is not None:
             display_pi_frame = yolo_annotated_pi_frame
         else:
             display_pi_frame = last_pi_frame
 
-        yolo_or_rec = state_manager.state in [DetectionState.YOLO_ROI, DetectionState.YOLO_FULL, DetectionState.RECORDING]
-        if yolo_or_rec and yolo_annotated_usb_frame is not None:
+        if (yolo_analysis_active or recording) and yolo_annotated_usb_frame is not None:
             display_usb_frame = yolo_annotated_usb_frame
         else:
             display_usb_frame = last_usb_frame
@@ -4613,246 +4252,403 @@ def main():
         if processed_pi_frame is not None and processed_pi_frame.size > 0:
             frame_queue.put(processed_pi_frame)
 
-        # --- Motion Detection Logic with NEW ARCHITECTURE State Machine ---
-        current_time = time.time()
-        
+        # --- Motion Detection Logic (Recording/Email Trigger) ---
         if not streaming_active and detection_active:
-            # Handle motion detection with proper state machine
-            if raw_motion_detected:
-                # Track detection times for motion source determination (ONLY when IDLE)
-                if state_manager.state == DetectionState.IDLE:
-                    if pi_detected and motion_detection_time_cam1 is None:
-                        motion_detection_time_cam1 = current_time
-                        logging.debug(f"Cam1 first detect time: {motion_detection_time_cam1}")
-                    if usb_detected and motion_detection_time_cam2 is None:
-                        motion_detection_time_cam2 = current_time
-                        logging.debug(f"Cam2 first detect time: {motion_detection_time_cam2}")
-                    
-                    # Determine motion source camera ONCE when first detecting motion
-                    determined_source = "cam1"  # Default
-                    if detection_camera == "both":
-                        if usb_detected and motion_detection_time_cam2 is not None and \
-                           (motion_detection_time_cam1 is None or motion_detection_time_cam2 < motion_detection_time_cam1 - 0.05):
-                            determined_source = "cam2"
-                        elif usb_detected and not pi_detected:
-                            determined_source = "cam2"
-                    elif detection_camera == "cam1":
-                        determined_source = "cam1"
-                    elif detection_camera == "cam2":
-                        determined_source = "cam2"
-                    
-                    # Motion detected - start confirmation and lock source camera
-                    state_manager.transition_to(DetectionState.MOTION_DETECTED)
-                    state_manager.source_camera = determined_source
-                    logging.debug(f"State machine: IDLE -> MOTION_DETECTED (source: {determined_source})")
+            if is_detected:
+                current_time = time.time() # Use a consistent time for checks
+                # Track detection times (only set if None)
+                if pi_detected and motion_detection_time_cam1 is None:
+                    motion_detection_time_cam1 = current_time
+                    logging.debug(f"Cam1 first detect time: {motion_detection_time_cam1}")
+                if usb_detected and motion_detection_time_cam2 is None:
+                    motion_detection_time_cam2 = current_time
+                    logging.debug(f"Cam2 first detect time: {motion_detection_time_cam2}")
                 
-                elif state_manager.state == DetectionState.MOTION_DETECTED:
-                    # Check if 1 second of motion has passed for confirmation
-                    if current_time - state_manager.motion_start_time >= 1.0:
-                        trigger_camera = "Camera 1" if state_manager.source_camera == "cam1" else "Camera 2"
-                        
-                        if config.get('use_yolo_detection', False):
-                            # Transition to YOLO ROI analysis
-                            state_manager.transition_to(DetectionState.MOTION_CONFIRMED)
-                            state_manager.transition_to(DetectionState.YOLO_ROI)
-                            logging.info(f"Motion confirmed on {trigger_camera}, starting ROI YOLO analysis")
-                            
-                            # Clear old YOLO annotations
-                            yolo_annotated_pi_frame = None
-                            yolo_annotated_usb_frame = None
-                        else:
-                            # No YOLO - proceed directly to recording
-                            logging.info(f"Motion confirmed on {trigger_camera}, proceeding to capture (YOLO disabled)")
-                            state_manager.transition_to(DetectionState.RECORDING)
-            
-            else:
-                # No motion - check if state machine needs timeout
-                state_manager.check_timeout(current_time)
-                
-                
-                # OLD LOGIC: Reset detection_check_start after 3 seconds of no motion
-                # This is now handled by state_manager.check_timeout()
-                if detection_check_start is not None and current_time - detection_check_start >= 3:
-                    logging.debug("Motion confirmation timeout - resetting (3s no motion)")
-                    detection_check_start = None
-        # --- NEW ARCHITECTURE: YOLO Analysis with YOLOManager ---
-        current_time = time.time()
-        
-        # Check state machine timeout (handles ROI and full frame timeouts automatically)
-        state_manager.check_timeout(current_time)
-        
-        # Submit frames for YOLO analysis based on current state
-        if state_manager.state == DetectionState.YOLO_ROI:
-            # Submit ROI for analysis (throttled by yolo_manager)
-            if yolo_manager.can_submit(current_time):
-                camera = state_manager.source_camera
-                
-                # Get the appropriate frame
-                if camera == "cam1" and original_pi_frame is not None:
-                    frame = original_pi_frame
-                elif camera == "cam2" and original_usb_frame is not None:
-                    frame = original_usb_frame
-                else:
-                    frame = None
-                
-                if frame is not None:
-                    # Get ROI coordinates
-                    roi_key = "roi_coordinates_cam2" if camera == "cam2" else "roi_coordinates"
-                    roi = config.get(roi_key, [0, 0, 640, 480])
-                    
-                    if isinstance(roi, list) and len(roi) == 4:
-                        roi_coords = tuple(roi)
-                    else:
-                        roi_coords = (roi.get('x', 0), roi.get('y', 0), 
-                                     roi.get('width', 640), roi.get('height', 480))
-                    
-                    yolo_manager.submit_roi(frame, camera, roi_coords, current_time)
-        
-        elif state_manager.state == DetectionState.YOLO_FULL:
-            # Submit full frame for verification
-            camera = state_manager.source_camera
-            
-            # Get the appropriate frame
-            if camera == "cam1" and original_pi_frame is not None:
-                frame = original_pi_frame
-            elif camera == "cam2" and original_usb_frame is not None:
-                frame = original_usb_frame
-            else:
-                frame = None
-            
-            if frame is not None:
-                yolo_manager.submit_full_frame(frame, camera, current_time)
-        
-        # Process YOLO results
-        if state_manager.state in [DetectionState.YOLO_ROI, DetectionState.YOLO_FULL]:
-            result = yolo_manager.process_results(state_manager)
-            
-            if result:
-                stage, contains_objects, annotated_frame = result
-                camera = state_manager.source_camera
-                
-                # Store annotated frame
-                if annotated_frame is not None:
-                    if camera == "cam1":
-                        yolo_annotated_pi_frame = annotated_frame
-                    else:
-                        yolo_annotated_usb_frame = annotated_frame
-                
-                # Handle state transitions based on result
-                if stage == "roi" and contains_objects:
-                    # Person detected in ROI - move to full frame verification
-                    state_manager.transition_to(DetectionState.YOLO_FULL)
-                
-                elif stage == "full_frame" and contains_objects:
-                    # Person confirmed in full frame - start recording
-                    state_manager.transition_to(DetectionState.RECORDING)
-                    # Mark detection as inactive (will record now)
-                    detection_active = False
-                
-                elif stage == "full_frame" and not contains_objects:
-                    # Verification failed - reset to idle
-                    state_manager.transition_to(DetectionState.IDLE)
-                    detection_active = True
+                # Determine motion source camera (simplified logic)
+                current_motion_source = "cam1" # Default
+                if detection_camera == "both":
+                    # Prefer Cam1 if both detected simultaneously or Cam1 first
+                    if usb_detected and motion_detection_time_cam2 is not None and \
+                       (motion_detection_time_cam1 is None or motion_detection_time_cam2 < motion_detection_time_cam1 - 0.05): # Cam2 clearly first
+                        current_motion_source = "cam2"
+                    # If only USB detected, it's USB
+                    elif usb_detected and not pi_detected:
+                         current_motion_source = "cam2"
+                    # Otherwise, it's Cam1 (includes Cam1 only, or Cam1 first/simultaneous)
+                    motion_source_camera = current_motion_source # Update global state
 
-        # --- NEW ARCHITECTURE: Recording with RecordingManager ---
-        if state_manager.state == DetectionState.RECORDING:
-            current_time = time.time()
-            
-            # Start recording if not active
-            if not recording_manager.active:
-                camera = state_manager.source_camera
-                
-                # Get the best available frame (YOLO-annotated preferred)
-                if camera == "cam1":
-                    frame = yolo_annotated_pi_frame if yolo_annotated_pi_frame is not None else processed_pi_frame
-                else:
-                    frame = yolo_annotated_usb_frame if yolo_annotated_usb_frame is not None else processed_usb_frame
-                
-                # Validate frame before starting
-                if frame is None or frame.size == 0 or np.all(frame == 0):
-                    logging.warning(f"Invalid frame from {camera} for recording. Resetting to IDLE.")
-                    state_manager.transition_to(DetectionState.IDLE)
-                    detection_active = True
-                else:
-                    # Get resolution for this camera
-                    cam_res_key = "cam1_resolution" if camera == "cam1" else "cam2_resolution"
-                    default_res = "640x480" if camera == "cam1" else "320x240"
-                    res_str = config.get(cam_res_key, default_res)
-                    
-                    try:
-                        w, h = map(int, res_str.split('x'))
-                        # Sanity check
-                        if not (100 < w < 4000 and 100 < h < 3000):
-                            raise ValueError("Unreasonable resolution")
-                        resolution = (w, h)
-                    except Exception as e:
-                        logging.warning(f"Invalid resolution '{res_str}': {e}. Using {default_res}")
-                        w, h = map(int, default_res.split('x'))
-                        resolution = (w, h)
-                    
-                    # Start recording
-                    if recording_manager.start(frame, camera, resolution, current_time):
-                        logging.info(f"Started recording from {camera} at {resolution}")
+                elif detection_camera == "cam1":
+                    motion_source_camera = "cam1"
+                elif detection_camera == "cam2":
+                    motion_source_camera = "cam2"
+                # No update if detection_camera == "disable"
+
+                # Start confirmation timer if not already started
+                if detection_check_start is None:
+                    detection_check_start = current_time
+                    logging.debug(f"Starting motion confirmation window at {current_time}")
+
+                # Check if confirmation duration passed
+                elif current_time - detection_check_start >= 1:
+                    trigger_camera = "Camera 1" if motion_source_camera == "cam1" else "Camera 2"
+
+                    # Only activate YOLO if it's enabled in config
+                    if config.get('use_yolo_detection', False):
+                        # PYTHON 3.14: Declare globals for two-stage YOLO
+                        global yolo_stage, roi_yolo_start_time, roi_yolo_detected_person
+
+                        # Activate two-stage YOLO analysis: ROI first, then full frame
+                        logging.info(f"Motion confirmed on {trigger_camera} (source: {motion_source_camera}), starting ROI YOLO analysis (5s timeout)")
+
+                        # Initialize ROI stage YOLO analysis
+                        yolo_analysis_active = True
+                        yolo_stage = "roi"  # Start with ROI stage
+                        roi_yolo_start_time = current_time
+                        roi_yolo_detected_person = False
+                        yolo_detected_object = False
+                        yolo_annotated_pi_frame = None  # Clear any previous annotations
+                        yolo_annotated_usb_frame = None  # Clear any previous annotations
                     else:
-                        logging.error("Failed to start recording. Resetting to IDLE.")
-                        state_manager.transition_to(DetectionState.IDLE)
-                        detection_active = True
-            
-            else:
-                # Recording active - write frames
-                camera = recording_manager.source_camera
-                frame_to_record = last_pi_frame if camera == "cam1" else last_usb_frame
-                
-                if frame_to_record is not None and frame_to_record.size > 0:
-                    recording_manager.write_frame(frame_to_record)
-                
-                # Check if recording should stop
-                if recording_manager.should_stop(current_time):
-                    video_path = recording_manager.stop()
-                    
-                    if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 100:
-                        detected_image = recording_manager.detected_frame
-                        
-                        if detected_image is not None and detected_image.size > 0:
-                            # Send email or save to storage
-                            if email_armed and not cooldown_active:
-                                email_trigger_source = "Camera 1" if camera == "cam1" else "Camera 2"
-                                logging.info(f"Sending email triggered by {email_trigger_source}")
-                                
-                                email_thread = threading.Thread(
-                                    target=send_email_in_thread,
-                                    args=(detected_image.copy(), video_path, sender_email, receiver_emails, email_password, camera),
-                                    daemon=True
-                                )
-                                email_thread.start()
-                            else:
-                                reason = "email not armed" if not email_armed else "cooldown active"
-                                logging.info(f"Saving media to storage ({reason})")
-                                save_media_to_storage(detected_image.copy(), video_path, camera)
-                            
-                            # Schedule video file deletion after email/save completes
-                            threading.Timer(2.0, lambda p=video_path: safe_unlink(p)).start()
-                        else:
-                            logging.warning("Detected image is invalid. Cannot send/save.")
-                            # Still cleanup video
-                            threading.Timer(2.0, lambda p=video_path: safe_unlink(p)).start()
-                    else:
-                        logging.warning(f"Recording failed - invalid video file: {video_path}")
-                    
-                    # Transition to cooldown
-                    state_manager.transition_to(DetectionState.COOLDOWN)
-                    detection_active = True
-                    
-                    # Clear YOLO annotations
-                    yolo_annotated_pi_frame = None
-                    yolo_annotated_usb_frame = None
-                    
-                    # Reset motion times
+                        # YOLO disabled - proceed directly to capture
+                        logging.info(f"Motion confirmed on {trigger_camera} (source: {motion_source_camera}), proceeding to capture (YOLO disabled)")
+                        detection_active = False
+                        detection_delay = current_time
+
+                    # Reset motion confirmation timer after successful confirmation
+                    detection_check_start = None
                     motion_detection_time_cam1 = None
                     motion_detection_time_cam2 = None
-                    
-                    logging.debug("Recording complete, transitioned to COOLDOWN")
+            else:
+                # Motion stopped - only reset if confirmation window has been going too long (3 seconds timeout)
+                # This prevents intermittent frames from resetting the confirmation timer
+                if detection_check_start is not None and current_time - detection_check_start >= 3:
+                    logging.debug(f"Motion confirmation timeout (3s), resetting confirmation timer")
+                    detection_check_start = None
+                    motion_detection_time_cam1 = None
+                    motion_detection_time_cam2 = None
+                
+        # --- Async YOLO Analysis on Camera Feeds (if active) ---
+        if yolo_analysis_active:
+            # PYTHON 3.14: Declare globals at the top of the block
+            global yolo_last_submission_time, yolo_pending_futures, full_frame_yolo_start_time
 
+            # Check for stage-specific timeouts
+            timeout_occurred = False
+            if yolo_stage == "roi":
+                if current_time - roi_yolo_start_time >= YOLO_ROI_TIMEOUT:
+                    logging.warning(f"ROI YOLO timeout ({YOLO_ROI_TIMEOUT}s) - no person detected in ROI, resetting")
+                    timeout_occurred = True
+            elif yolo_stage == "full_frame":
+                if current_time - full_frame_yolo_start_time >= YOLO_FULL_FRAME_TIMEOUT:
+                    logging.warning(f"Full frame YOLO timeout ({YOLO_FULL_FRAME_TIMEOUT}s), resetting")
+                    timeout_occurred = True
+
+            if timeout_occurred:
+                yolo_analysis_active = False
+                yolo_stage = None
+                roi_yolo_start_time = 0.0
+                full_frame_yolo_start_time = 0.0
+                roi_yolo_detected_person = False
+                yolo_detected_object = False
+                yolo_annotated_pi_frame = None
+                yolo_annotated_usb_frame = None
+                detection_active = True
+                yolo_pending_futures.clear()
+            else:
+                # PYTHON 3.14: Submit frame to ParallelYOLOProcessor (throttled)
+
+                # Only submit if enough time has passed since last submission
+                if current_time - yolo_last_submission_time >= YOLO_SUBMISSION_INTERVAL:
+                    frame_to_analyze = None
+                    camera_analyzing = None
+
+                    # Two-stage YOLO: ROI first, then full frame for verification
+                    if yolo_stage == "roi":
+                        # Extract ROI from full frame for analysis
+                        roi_key = "roi_coordinates_cam2" if motion_source_camera == "cam2" else "roi_coordinates"
+                        roi = config.get(roi_key, [0, 0, 640, 480])
+                        if isinstance(roi, list) and len(roi) == 4:
+                            x, y, w, h = roi
+                        else:
+                            x = roi.get("x", 0); y = roi.get("y", 0)
+                            w = roi.get("width", 640); h = roi.get("height", 480)
+
+                        if motion_source_camera == "cam1" and original_pi_frame is not None:
+                            roi_frame = original_pi_frame[y:y+h, x:x+w].copy()
+                            frame_to_analyze = roi_frame
+                            camera_analyzing = "cam1"
+                            logging.debug(f"Extracted ROI frame ({w}x{h}) from cam1")
+                        elif motion_source_camera == "cam2" and original_usb_frame is not None:
+                            roi_frame = original_usb_frame[y:y+h, x:x+w].copy()
+                            frame_to_analyze = roi_frame
+                            camera_analyzing = "cam2"
+                            logging.debug(f"Extracted ROI frame ({w}x{h}) from cam2")
+
+                        if frame_to_analyze is not None:
+                            logging.info(f"Submitting ROI frame ({w}x{h}) from {camera_analyzing} to YOLO")
+
+                    elif yolo_stage == "full_frame":
+                        # Use full frame for verification
+                        if motion_source_camera == "cam1" and original_pi_frame is not None:
+                            frame_to_analyze = original_pi_frame.copy()
+                            camera_analyzing = "cam1"
+                            logging.debug(f"Using original Pi frame for full frame YOLO (shape: {original_pi_frame.shape})")
+                        elif motion_source_camera == "cam2" and original_usb_frame is not None:
+                            frame_to_analyze = original_usb_frame.copy()
+                            camera_analyzing = "cam2"
+                            logging.debug(f"Using original USB frame for full frame YOLO (shape: {original_usb_frame.shape})")
+
+                        if frame_to_analyze is not None:
+                            logging.info(f"Submitting FULL frame from {camera_analyzing} to YOLO for verification")
+
+                    # Submit to ParallelYOLOProcessor if we have a frame and processor is available
+                    if frame_to_analyze is not None and camera_analyzing is not None and yolo_processor is not None:
+                        future = yolo_processor.process_frame_async(frame_to_analyze, camera_analyzing, current_time)
+                        yolo_pending_futures.append(future)
+                        yolo_last_submission_time = current_time
+
+        # --- Process YOLO Results (Async) ---
+        # PYTHON 3.14: Check if any YOLO futures are ready (non-blocking)
+        # Only process results if YOLO analysis is currently active to avoid stale results
+        if yolo_analysis_active and yolo_pending_futures:
+            # Check all pending futures for completion
+            for future in yolo_pending_futures[:]:  # Copy list to allow removal during iteration
+                if future.done():
+                    try:
+                        yolo_result = future.result()
+
+                        # Unpack result
+                        result_camera = yolo_result['camera']
+                        annotated_frame = yolo_result['annotated_frame']
+                        contains_objects = yolo_result['contains_objects']
+                        processing_time = yolo_result['processing_time']
+
+                        # Two-stage result handling: ROI first, then full frame
+                        if contains_objects:
+                            if yolo_stage == "roi":
+                                # Person detected in ROI - transition to full frame verification
+                                logging.info(f"[OK] Person detected in ROI on {result_camera.upper()} (took {processing_time:.2f}s), proceeding to full frame verification")
+                                roi_yolo_detected_person = True
+                                yolo_stage = "full_frame"
+                                full_frame_yolo_start_time = current_time
+                                yolo_last_submission_time = 0  # Submit full frame immediately
+
+                                # Composite ROI annotations onto full frame for display
+                                roi_key = "roi_coordinates_cam2" if result_camera == "cam2" else "roi_coordinates"
+                                roi = config.get(roi_key, [0, 0, 640, 480])
+                                if isinstance(roi, list) and len(roi) == 4:
+                                    x, y, w, h = roi
+                                else:
+                                    x = roi.get("x", 0); y = roi.get("y", 0)
+                                    w = roi.get("width", 640); h = roi.get("height", 480)
+
+                                if result_camera == "cam1" and original_pi_frame is not None:
+                                    yolo_annotated_pi_frame = original_pi_frame.copy()
+                                    yolo_annotated_pi_frame[y:y+h, x:x+w] = cv2.resize(annotated_frame, (w, h))
+                                elif result_camera == "cam2" and original_usb_frame is not None:
+                                    yolo_annotated_usb_frame = original_usb_frame.copy()
+                                    yolo_annotated_usb_frame[y:y+h, x:x+w] = cv2.resize(annotated_frame, (w, h))
+
+                            elif yolo_stage == "full_frame":
+                                # Person confirmed in full frame - trigger capture
+                                logging.info(f"[OK] Person CONFIRMED in full frame on {result_camera.upper()} (took {processing_time:.2f}s), triggering capture")
+                                yolo_detected_object = True
+                                yolo_analysis_active = False
+                                yolo_stage = None
+                                roi_yolo_start_time = 0.0
+                                full_frame_yolo_start_time = 0.0
+                                roi_yolo_detected_person = False
+                                detection_active = False
+                                detection_delay = current_time
+
+                                # Store full frame annotations
+                                if result_camera == "cam1":
+                                    yolo_annotated_pi_frame = annotated_frame
+                                elif result_camera == "cam2":
+                                    yolo_annotated_usb_frame = annotated_frame
+
+                        else:
+                            # No objects detected
+                            if yolo_stage == "roi":
+                                logging.debug(f"No person in ROI on {result_camera.upper()}, continuing analysis...")
+                            elif yolo_stage == "full_frame":
+                                logging.warning(f"ROI had person but full frame verification failed on {result_camera.upper()}, resetting")
+                                yolo_analysis_active = False
+                                yolo_stage = None
+                                roi_yolo_start_time = 0.0
+                                full_frame_yolo_start_time = 0.0
+                                roi_yolo_detected_person = False
+                                detection_active = True
+
+                        # Remove processed future
+                        yolo_pending_futures.remove(future)
+
+                    except Exception as e:
+                        logging.error(f"Error processing YOLO future result: {e}")
+                        yolo_pending_futures.remove(future)
+
+        # If YOLO analysis has ended and no object was detected, re-enable motion detection
+        if not yolo_analysis_active and yolo_analysis_start_time is None and not yolo_detected_object:
+            # Check if we just finished a YOLO cycle without detections
+            # (This should only trigger once after analysis completes)
+            pass
+
+        # --- Capture Still Image and Start Recording ---
+        if detection_delay and current_time >= detection_delay and detected_image is None:
+            # Capture image from the determined source camera
+            # Use YOLO-annotated frame if available, otherwise use regular processed frame
+            if motion_source_camera == "cam1":
+                if yolo_annotated_pi_frame is not None:
+                    detected_image = yolo_annotated_pi_frame.copy()  # Use YOLO-annotated frame for email
+                else:
+                    detected_image = processed_pi_frame.copy()  # Fall back to regular frame
+            else:  # cam2
+                if yolo_annotated_usb_frame is not None:
+                    detected_image = yolo_annotated_usb_frame.copy()  # Use YOLO-annotated frame for email
+                else:
+                    detected_image = processed_usb_frame.copy()  # Fall back to regular frame
+            
+            # Validate captured image
+            if detected_image is None or detected_image.size == 0 or np.all(detected_image == 0):
+                logging.warning(f"Detected image from {motion_source_camera} is invalid. Skipping recording/email.")
+                # Reset state without recording/email
+                recording = False
+                detection_active = True # Re-enable detection
+                detection_delay = None
+                detected_image = None
+                # Keep motion times None as detection failed essentially
+            else:
+                logging.info(f"Still image captured from {motion_source_camera}")
+                recording = True
+                try:
+                    temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                except Exception as e:
+                    logging.error(f"Failed to create temp video file: {e}")
+                    recording = False # Cannot record
+                    detection_active = True
+                    detection_delay = None
+                    detected_image = None
+                    continue # Skip to next loop iteration
+
+                # Determine recording resolution based on source camera config
+                cam_res_key = "cam1_resolution" if motion_source_camera == "cam1" else "cam2_resolution"
+                default_res = "640x480" if motion_source_camera == "cam1" else "320x240"
+                res_str = config.get(cam_res_key, default_res)
+                try:
+                    video_resolution = tuple(map(int, res_str.split('x')))
+                    # Basic sanity check on resolution
+                    if not (100 < video_resolution[0] < 4000 and 100 < video_resolution[1] < 3000):
+                         raise ValueError("Unreasonable resolution")
+                except Exception as e:
+                    logging.warning(f"Invalid resolution string '{res_str}' for {motion_source_camera}: {e}. Falling back to {default_res}.")
+                    video_resolution = tuple(map(int, default_res.split('x'))) # Fallback
+                    
+                # Create VideoWriter
+                try:
+                    video_writer = cv2.VideoWriter(temp_video_file.name, cv2.VideoWriter_fourcc(*'mp4v'), 30, video_resolution)
+                    if not video_writer.isOpened():
+                         raise IOError("VideoWriter failed to open.")
+                    detection_start_time = current_time
+                    logging.info(f"Started recording video (source: {motion_source_camera}, res: {video_resolution}) to {temp_video_file.name}")
+                except Exception as e:
+                     logging.error(f"Failed to create VideoWriter: {e}")
+                     recording = False
+                     video_writer = None
+                     if temp_video_file:
+                         temp_video_file.close()
+                         try: os.unlink(temp_video_file.name)
+                         except (OSError, FileNotFoundError) as file_err:
+                             logging.debug(f"Could not delete temp file: {file_err}")
+                             pass
+                     temp_video_file = None
+                     detection_active = True
+                     detection_delay = None
+                     detected_image = None
+
+
+        # --- Write Frames to Video ---
+        if recording:
+             # Use the correct LAST PROCESSED frame for recording based on the source
+             frame_to_record = last_pi_frame if motion_source_camera == "cam1" else last_usb_frame
+
+             # Validate frame and writer
+             if frame_to_record is not None and frame_to_record.size > 0 and video_writer is not None and video_writer.isOpened():
+                 # Ensure frame matches video writer resolution (resize if necessary)
+                 if frame_to_record.shape[1] != video_resolution[0] or frame_to_record.shape[0] != video_resolution[1]:
+                     try:
+                        frame_to_record = cv2.resize(frame_to_record, video_resolution, interpolation=cv2.INTER_AREA)
+                     except Exception as resize_err:
+                        logging.error(f"Error resizing frame ({frame_to_record.shape}) for recording to {video_resolution}: {resize_err}")
+                        frame_to_record = None # Avoid writing bad frame
+
+                 if frame_to_record is not None:
+                     try:
+                         video_writer.write(frame_to_record)
+                     except Exception as write_err:
+                         logging.error(f"Error writing frame to video: {write_err}")
+                         # Consider stopping recording?
+
+             # --- Recording Stop and Email/Save Logic ---
+             elapsed_time = current_time - detection_start_time if detection_start_time else 0
+             if elapsed_time >= minimum_recording_duration:
+                if video_writer:
+                     video_writer.release()
+                     logging.debug("VideoWriter released.")
+                video_writer = None
+                recording = False # Stop recording state
+                logging.info(f"Stopped recording video (duration: {elapsed_time:.2f}s)")
+                
+                # Check if media exists before sending/saving
+                video_file_exists = temp_video_file and os.path.exists(temp_video_file.name) and os.path.getsize(temp_video_file.name) > 100 # Check size > 100 bytes
+                image_valid = detected_image is not None and detected_image.size > 0
+
+                if image_valid and video_file_exists:
+                    if email_armed and not cooldown_active:
+                        email_trigger_source = "Camera 1" if motion_source_camera == "cam1" else "Camera 2"
+                        logging.info(f"Sending email triggered by {email_trigger_source}")
+                        # Pass copies to the thread to avoid issues if main loop modifies them
+                        email_thread = threading.Thread(
+                            target=send_email_in_thread,
+                            args=(detected_image.copy(), temp_video_file.name, sender_email, receiver_emails, email_password),
+                            daemon=True
+                        )
+                        email_thread.start()
+                    else:
+                        reason = "email not armed" if not email_armed else "cooldown active"
+                        logging.info(f"Saving media to storage ({reason})...")
+                        # Pass copies to avoid issues
+                        save_media_to_storage(detected_image.copy(), temp_video_file.name)
+                else:
+                    logging.warning(f"Missing or invalid media (Image valid: {image_valid}, Video valid: {video_file_exists}). Cannot send/save.")
+
+                # Cleanup and Reset State (always happens after recording duration)
+                detected_image = None # Clear captured image
+                if temp_video_file:
+                    video_path_to_delete = temp_video_file.name # Store path before closing
+                    try:
+                        temp_video_file.close()
+                        # Give email/save thread a moment before deleting
+                        threading.Timer(2.0, lambda p=video_path_to_delete: safe_unlink(p)).start()
+                    except Exception as e:
+                        logging.error(f"Error closing temporary file {video_path_to_delete}: {e}")
+                        # Still try to schedule deletion
+                        threading.Timer(2.0, lambda p=video_path_to_delete: safe_unlink(p)).start()
+                    temp_video_file = None
+                
+                detection_start_time = None
+                detection_active = True # Re-enable detection processing
+                detection_delay = None
+                # Reset YOLO detection state
+                yolo_detected_object = False
+                yolo_analysis_active = False
+                yolo_analysis_start_time = None
+                yolo_annotated_pi_frame = None  # Clear annotated frames
+                yolo_annotated_usb_frame = None  # Clear annotated frames
+                # Reset motion times after event is fully processed
+                motion_detection_time_cam1 = None
+                motion_detection_time_cam2 = None
+                logging.debug("Reset motion tracking and YOLO state after event handling")
+                time.sleep(1) # Brief pause after detection event
 
         # --- UI Updates and Key Handling (largely unchanged) ---
         # Ensure dialogs exist before updating
@@ -5154,3 +4950,4 @@ def add_timer_info_to_frame(frame):
 if __name__ == "__main__":
     os.environ["QT_QPA_PLATFORM"] = "xcb"
     main()
+

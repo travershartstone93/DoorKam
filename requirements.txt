@@ -1,0 +1,12 @@
+# DoorKam dependencies — Python 3.12+ (3.14 free-threaded recommended)
+opencv-python>=4.8
+numpy>=1.26
+ultralytics>=8.0
+flask>=3.0
+flask-limiter>=3.5
+flask-wtf>=1.2
+wtforms>=3.0
+email-validator>=2.0
+bcrypt>=4.0
+python-dotenv>=1.0
+imageio>=2.31
