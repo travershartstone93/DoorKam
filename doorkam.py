@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-DoorKam Security Camera System - Python 3.14 Free-Threaded Edition
-Optimized for true parallelism with GIL disabled.
+DoorKam: self-hosted security camera system with YOLO object detection,
+a Flask web dashboard, and email alerts.
 
-Requirements:
-    - Python 3.14+ (free-threaded build recommended)
-    - Run with: PYTHON_GIL=0 python3 doorkam.py
-    - For best performance: use python3.14t if available
+Run with: python3 doorkam.py
+For best performance use a free-threaded Python build (3.14+) with PYTHON_GIL=0.
 """
 
-from __future__ import annotations  # PEP 649: Deferred annotation evaluation
+from __future__ import annotations
 import sys
 import os
 import logging
@@ -19,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Python 3.14 version check
 if sys.version_info < (3, 14):
-    logging.warning(f"[WARN]️  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
+    logging.warning(f"[WARN]  Python 3.14+ recommended (using {sys.version_info.major}.{sys.version_info.minor})")
     logging.warning("   Some features may not be available or may have reduced performance")
     logging.warning("   Install Python 3.14 for optimal performance")
 
@@ -58,7 +56,7 @@ import re
 import secrets
 from ultralytics import YOLO  # For YOLOv11 with segmentation
 
-# Python 3.14+ specific imports for modern features
+# Typing and concurrency imports
 from dataclasses import dataclass, field
 from typing import (
     Literal, Optional, Tuple, Dict, List, Any, Callable,
@@ -69,7 +67,7 @@ from functools import wraps
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-# Python 3.14 specific: Check for subinterpreters (PEP 734)
+# Check for subinterpreter support
 SUBINTERPRETERS_AVAILABLE = False
 try:
     from concurrent.interpreters import create, run_in_thread, InterpreterPoolExecutor
@@ -84,15 +82,15 @@ if hasattr(sys, '_is_gil_enabled'):
 elif os.getenv('PYTHON_GIL') == '0':
     GIL_DISABLED = True
 
-# Log Python 3.14 capabilities
+# Log free-threading status
 if sys.version_info >= (3, 14):
     if GIL_DISABLED:
-        logging.info("🚀 Running in FREE-THREADED mode (no GIL) - maximum performance enabled")
+        logging.info("Running with GIL disabled")
     else:
-        logging.warning("[WARN]️  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
+        logging.warning("[WARN]  Running with GIL enabled - consider PYTHON_GIL=0 for better performance")
 
     if SUBINTERPRETERS_AVAILABLE:
-        logging.info("[OK] Subinterpreters available (PEP 734)")
+        logging.info("[OK] Subinterpreters available")
     else:
         logging.info("[INFO] Subinterpreters not available - using standard threading")
 
@@ -107,7 +105,7 @@ ROTATION_COOLDOWN = 0.5  # Seconds
 FRAME_QUEUE_SIZE = 30  # Frames - increased from 10 to reduce dropped frames under load
 
 # ============================================================================
-# PYTHON 3.14: Type-Safe Configuration Classes
+# Type-Safe Configuration Classes
 # ============================================================================
 
 # Type aliases for better readability
@@ -188,7 +186,7 @@ class AppConfig:
     background_threshold: int = 25
 
     def validate(self) -> List[str]:
-        """Comprehensive configuration validation with detailed error messages"""
+        """Validate the configuration and return a list of error messages"""
         errors = []
 
         # Port validation
@@ -358,7 +356,7 @@ class AppConfig:
                 background_threshold=raw_config.get('background_threshold', 25)
             )
 
-            # Validate with comprehensive error reporting
+            # Validate and collect errors
             errors = app_config.validate()
             if errors:
                 logging.error("=" * 80)
@@ -381,7 +379,7 @@ class AppConfig:
             return cls()
 
 # ============================================================================
-# PYTHON 3.14: Lock-Free Data Structures
+# Lock-Free Data Structures
 # ============================================================================
 
 class LockFreeQueue:
@@ -576,7 +574,7 @@ class CameraReconnector:
         }
 
 # ============================================================================
-# PYTHON 3.14: Parallel YOLO Processor
+# Parallel YOLO Processor
 # ============================================================================
 
 class ParallelYOLOProcessor:
@@ -698,7 +696,7 @@ class ParallelYOLOProcessor:
         logging.info("YOLO processor shutdown complete")
 
 # ============================================================================
-# PYTHON 3.14: Performance Monitoring
+# Performance Monitoring
 # ============================================================================
 
 @dataclass
@@ -756,7 +754,7 @@ def measure_performance(metric_name: str):
     return decorator
 
 # ============================================================================
-# PYTHON 3.14: Context Managers for Safe Resource Management
+# Context Managers for Safe Resource Management
 # ============================================================================
 
 @contextmanager
@@ -828,7 +826,7 @@ def video_writer_context(
 # ============================================================================
 
 # ============================================================================
-# PYTHON 3.14: Global Instances (Lock-Free)
+# Global Instances (Lock-Free)
 # ============================================================================
 
 # Global performance metrics instance
@@ -841,7 +839,7 @@ cam2_state = AtomicCameraState()
 # ============================================================================
 
 # ============================================================================
-# PYTHON 3.14: Refactored Global Variables (Lock-Free)
+# Refactored Global Variables (Lock-Free)
 # ============================================================================
 
 # Application state
@@ -852,7 +850,7 @@ detection_active = True
 detection_camera = "cam1"
 pipeline_process = None
 
-# PYTHON 3.14: Lock-free queues (replaced queue.Queue with LockFreeQueue)
+# Lock-free queues (replaced queue.Queue with LockFreeQueue)
 # Note: frame_queue for Pi camera pipeline (single process), usb_frame_queue must use multiprocessing.Queue
 frame_queue = LockFreeQueue(maxsize=FRAME_QUEUE_SIZE)
 usb_frame_queue = multiprocessing.Queue(maxsize=FRAME_QUEUE_SIZE)  # Must use multiprocessing.Queue for subprocess
@@ -881,13 +879,11 @@ last_timer_check = 0
 screen_width = 0
 screen_height = 0
 
-# PYTHON 3.14: Removed rotation locks - now using AtomicCameraState (cam1_state, cam2_state)
-# rotation_lock = threading.Lock()  # REMOVED - lock-free now
-# media_lock = threading.Lock()  # REMOVED - will use atomic operations
+# Removed rotation locks - now using AtomicCameraState (cam1_state, cam2_state)
 
 # Configuration
 config = {}  # Will be replaced with AppConfig instance
-app_config: Optional[AppConfig] = None  # PYTHON 3.14: Type-safe config
+app_config: Optional[AppConfig] = None  # Type-safe config
 authorized_users = {}
 
 # Background subtractors
@@ -898,7 +894,7 @@ bg_subtractor_cam2 = None
 knn_frame_counter_cam1 = 0
 knn_frame_counter_cam2 = 0
 
-# PYTHON 3.14: YOLO will be replaced with ParallelYOLOProcessor
+# YOLO will be replaced with ParallelYOLOProcessor
 yolo_processor: Optional[ParallelYOLOProcessor] = None  # New parallel processor
 yolo_model = None  # Legacy - will be removed after migration
 
@@ -910,7 +906,7 @@ yolo_detected_object = False
 yolo_annotated_pi_frame = None
 yolo_annotated_usb_frame = None
 
-# PYTHON 3.14: YOLO futures for async processing
+# YOLO futures for async processing
 yolo_pending_futures = []  # Store futures from ParallelYOLOProcessor
 yolo_last_submission_time = 0
 YOLO_SUBMISSION_INTERVAL = 1.5
@@ -952,12 +948,12 @@ def get_local_ip():
 # Load config
 CONFIG_FILE = "config.json"
 # ============================================================================
-# PYTHON 3.14: Modern Config Loading with Type Safety
+# Modern Config Loading with Type Safety
 # ============================================================================
 
 def load_config_modern() -> AppConfig:
     """
-    PYTHON 3.14: Load configuration using type-safe AppConfig dataclass.
+    Load configuration using type-safe AppConfig dataclass.
     This is the preferred method for new code.
     """
     global app_config, yolo_processor
@@ -986,7 +982,7 @@ def load_config():
     global config, detection_camera, email_rotation_cam1, app_config
     global timer_enabled, schedule_arm_time, schedule_disarm_time, schedule_arm_seconds, schedule_disarm_seconds
 
-    # PYTHON 3.14: Load modern type-safe config first
+    # Load modern type-safe config first
     app_config = load_config_modern()
 
     # Populate legacy config dict for backward compatibility
@@ -1162,7 +1158,7 @@ def cleanup(signum=None, frame=None):
 
     logging.info("Starting cleanup process...")
 
-    # PYTHON 3.14: Shutdown YOLO processor (replaces old worker thread)
+    # Shutdown YOLO processor (replaces old worker thread)
     if 'yolo_processor' in globals() and yolo_processor is not None:
         try:
             logging.debug("Shutting down YOLO processor...")
@@ -1459,7 +1455,7 @@ def gen_frames(web_cam1_rotation, web_cam2_rotation):
                 time.sleep(0.001)
                 continue
 
-            # PYTHON 3.14: Lock-free queue access - get() returns None if empty
+            # Lock-free queue access - get() returns None if empty
             picam_frame = frame_queue.get() or last_picam_frame
             usb_frame = usb_frame_queue.get() or last_usb_frame
 
@@ -1538,10 +1534,10 @@ def generate_thumbnail(src_path, dest_path, is_video=False):
         logging.error(f"Error generating thumbnail for {src_path}: {e}")
 
 def save_media_to_storage(image, video_path):
-    """PYTHON 3.14: Lock-free media storage - filesystem operations are atomic"""
+    """Lock-free media storage - filesystem operations are atomic"""
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
 
-    # PYTHON 3.14: No media_lock needed - filesystem operations are atomic
+    # No media_lock needed - filesystem operations are atomic
     os.makedirs("stored_media", exist_ok=True)
     image_path = f"stored_media/{timestamp}_image.jpg"
     video_dest_path = f"stored_media/{timestamp}_video.mp4"
@@ -1563,9 +1559,9 @@ def save_media_to_storage(image, video_path):
     logging.info(f"Media saved to storage: {image_path}, {video_dest_path}")
 
 def purge_old_media():
-    """PYTHON 3.14: Lock-free media purging - filesystem operations are atomic"""
+    """Lock-free media purging - filesystem operations are atomic"""
     while True:
-        # PYTHON 3.14: No media_lock needed - filesystem operations are atomic
+        # No media_lock needed - filesystem operations are atomic
         now = time.time()
         if os.path.exists("stored_media"):
             for filename in os.listdir("stored_media"):
@@ -1654,11 +1650,11 @@ def video_stream():
 @app.route('/rotate_web_cam1', methods=['POST'])
 @login_required
 def rotate_web_cam1():
-    """PYTHON 3.14: Lock-free rotation using atomic operations"""
+    """Lock-free rotation using atomic operations"""
     global last_rotation_time
     current_time = time.time()
 
-    # PYTHON 3.14: No lock needed - atomic operation
+    # No lock needed - atomic operation
     if current_time - last_rotation_time >= ROTATION_COOLDOWN:
         session['web_cam1_rotation'] = (session.get('web_cam1_rotation', 0) + 90) % 360
         last_rotation_time = current_time
@@ -1668,11 +1664,11 @@ def rotate_web_cam1():
 @app.route('/rotate_web_cam2', methods=['POST'])
 @login_required
 def rotate_web_cam2():
-    """PYTHON 3.14: Lock-free rotation using atomic operations"""
+    """Lock-free rotation using atomic operations"""
     global last_rotation_time
     current_time = time.time()
 
-    # PYTHON 3.14: No lock needed - atomic operation
+    # No lock needed - atomic operation
     if current_time - last_rotation_time >= ROTATION_COOLDOWN:
         # Update only the web rotation in session - don't modify the shared cam2_rotation value
         session['web_cam2_rotation'] = (session.get('web_cam2_rotation', 0) + 90) % 360
@@ -1740,7 +1736,7 @@ def logout():
 @app.route('/health')
 def health():
     """
-    System health endpoint with comprehensive metrics.
+    System health endpoint.
     Returns JSON with camera status, queue metrics, and system state.
     Does not require authentication for monitoring purposes, but only
     logged-in users get the full payload.
@@ -1896,10 +1892,10 @@ def document():
 @app.route('/stored_media')
 @login_required
 def stored_media():
-    """PYTHON 3.14: Lock-free media listing - filesystem operations are atomic"""
+    """Lock-free media listing - filesystem operations are atomic"""
     media_files = []
 
-    # PYTHON 3.14: No media_lock needed - filesystem operations are atomic
+    # No media_lock needed - filesystem operations are atomic
     if os.path.exists("stored_media"):
         for filename in os.listdir("stored_media"):
             if filename.endswith(("_image.jpg", "_video.mp4")):
@@ -1970,8 +1966,8 @@ def serve_media(filename):
 @app.route('/purge_media', methods=['POST'])
 @login_required
 def purge_media():
-    """PYTHON 3.14: Lock-free media purging - filesystem operations are atomic"""
-    # PYTHON 3.14: No media_lock needed - filesystem operations are atomic
+    """Lock-free media purging - filesystem operations are atomic"""
+    # No media_lock needed - filesystem operations are atomic
     if os.path.exists("stored_media"):
         shutil.rmtree("stored_media")
         os.makedirs("stored_media", exist_ok=True)
@@ -2034,62 +2030,6 @@ def detect_objects_with_yolo(frame):
         logging.error(f"Error in YOLO detection: {str(e)}")
         return [], frame, False
 
-# PYTHON 3.14: OLD YOLO WORKER - REPLACED WITH ParallelYOLOProcessor
-# This function is no longer used - kept for reference only
-"""
-def yolo_worker():
-    '''
-    Async YOLO worker thread that processes frames from the request queue
-    and puts results into the response queue without blocking the main loop.
-
-    DEPRECATED: Replaced with ParallelYOLOProcessor using ThreadPoolExecutor
-    '''
-    global yolo_worker_running, yolo_model
-
-    logging.info("YOLO worker thread started")
-
-    while yolo_worker_running:
-        try:
-            # Try to get a frame request with timeout to allow checking the running flag
-            try:
-                request = yolo_request_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            # Unpack request
-            frame, camera, request_time = request
-
-            # Skip if frame is invalid
-            if frame is None or frame.size == 0:
-                logging.warning("YOLO worker received invalid frame")
-                continue
-
-            # Process with YOLO
-            start_time = time.time()
-            detections, annotated_frame, contains_objects = detect_objects_with_yolo(frame)
-            processing_time = time.time() - start_time
-
-            logging.debug(f"YOLO processing took {processing_time:.2f}s for {camera}")
-
-            # Put result in response queue (non-blocking, drop if full)
-            try:
-                yolo_response_queue.put_nowait({
-                    'camera': camera,
-                    'annotated_frame': annotated_frame,
-                    'contains_objects': contains_objects,
-                    'request_time': request_time,
-                    'processing_time': processing_time
-                })
-            except queue.Full:
-                logging.warning("YOLO response queue full, dropping result")
-
-        except Exception as e:
-            logging.error(f"Error in YOLO worker thread: {e}")
-            time.sleep(0.1)  # Prevent tight error loop
-
-    logging.info("YOLO worker thread stopped")
-"""
-
 def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtraction=True):
     global detection_active, detection_camera, yolo_analysis_active
     global knn_frame_counter_cam1, knn_frame_counter_cam2
@@ -2102,7 +2042,7 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
     if not detection_active or streaming_active or recording or yolo_analysis_active:
         # Return previous_frame for frame diff, or None if using BG subtraction (as it's not needed)
         return_prev = previous_frame if previous_frame is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return frame, False, return_prev, False # Added False for yolo_contains_objects
+        return frame, False, return_prev, False
         
     # Check if the detection is enabled for this camera
     is_detection_enabled = False
@@ -2126,7 +2066,7 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
     if not is_detection_enabled:
         # Return previous_frame for frame diff, or None if using BG subtraction
         return_prev = previous_frame if previous_frame is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return frame_with_text, False, return_prev, False # Added False for yolo_contains_objects
+        return frame_with_text, False, return_prev, False
 
     try:
         # Use camera-specific ROI coordinates
@@ -2278,7 +2218,7 @@ def process_frame(frame, bg_subtractor, previous_frame, camera, use_bg_subtracti
                 #     kernel = np.ones((3, 3), np.uint8)
                 #     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-                thresh = cv2.dilate(thresh, None, iterations=1)  # Reduced from 2 to 1 for better edge preservation
+                thresh = cv2.dilate(thresh, None, iterations=1)  # 1 px keeps edges sharp
                 
                 # Update previous frame for next iteration ONLY when using frame differencing
                 updated_previous_frame = gray.copy()
@@ -2578,8 +2518,7 @@ class ToggleDialog(tk.Toplevel):
         # Toggle state
         email_armed = not email_armed
         
-        # CRITICAL: Also update detection_active to match email_armed state
-        # This ensures that motion detection stops when disarmed
+        # Also update detection_active so motion detection stops when disarmed
         if detection_camera != "disable":  # If detection isn't manually disabled
             detection_active = email_armed
             
@@ -3084,16 +3023,16 @@ class SettingsDialog(tk.Toplevel):
             logging.error(f"Error in add_user: {e}")
 
     def rotate_cam1(self):
-        """PYTHON 3.14: Lock-free rotation using AtomicCameraState"""
+        """Lock-free rotation using AtomicCameraState"""
         global last_rotation_time
         current_time = time.time()
 
-        # PYTHON 3.14: Use atomic camera state
+        # Use atomic camera state
         if cam1_state.rotate_atomic(current_time, ROTATION_COOLDOWN):
             logging.info(f"Settings: Camera 1 rotation set to {cam1_state.get_rotation()} degrees")
 
     def rotate_cam2(self):
-        """PYTHON 3.14: Rotation with multiprocessing.Value lock (for cross-process safety)"""
+        """Rotation with multiprocessing.Value lock (for cross-process safety)"""
         global cam2_rotation, last_rotation_time
         current_time = time.time()
 
@@ -3375,7 +3314,7 @@ class SettingsDialog(tk.Toplevel):
                     detection_camera = new_config["detection_camera"]
                     logging.info(f"Detection camera updated to: {detection_camera}")
                     
-                    # PYTHON 3.14: Reload YOLO processor if setting changed
+                    # Reload YOLO processor if setting changed
                     if config.get('use_yolo_detection', False) != original_yolo_setting:
                         global yolo_processor
                         logging.info("YOLO detection setting changed. Reloading...")
@@ -3742,7 +3681,7 @@ def main():
     global motion_detection_time_cam1, motion_detection_time_cam2, pending_roi_activation, pending_ui_update
     global bg_subtractor_cam1, bg_subtractor_cam2, last_timer_check
     global yolo_analysis_active, yolo_analysis_start_time, yolo_detected_object
-    # PYTHON 3.14: Removed old YOLO worker globals (yolo_worker_thread, yolo_worker_running, yolo_request_queue, yolo_response_queue)
+    # Removed old YOLO worker globals (yolo_worker_thread, yolo_worker_running, yolo_request_queue, yolo_response_queue)
     global yolo_last_submission_time, yolo_pending_futures
     global yolo_annotated_pi_frame, yolo_annotated_usb_frame
     global roi_selection_mode, roi_temp
@@ -3765,7 +3704,7 @@ def main():
     load_config()
     logging.debug(f"Config after initial load in main: {type(config)}, {config}")
     
-    # PYTHON 3.14: YOLO processor is now initialized in load_config_modern()
+    # YOLO processor is now initialized in load_config_modern()
     # Old worker thread initialization removed - using ParallelYOLOProcessor instead
     load_yolo_model()  # Legacy - still needed for backward compatibility
     if config.get('use_yolo_detection', False):
@@ -3800,7 +3739,6 @@ def main():
     logging.info("Initialized KNN background subtractors for both cameras.")
 
     # FORCE RESET ROI COORDINATES TO VALID VALUES
-    # This ensures that regardless of what was in the config file, we start with valid ROI
     # Set ROI to full frame for each camera type
     # config["roi_coordinates"] = [0, 0, 640, 480]  # Pi camera (typically 640x480)
     # config["roi_coordinates_cam2"] = [0, 0, 320, 240]  # USB camera (typically 320x240)
@@ -3857,7 +3795,7 @@ def main():
     # Initialize UI Dialogs
     logging.debug(f"Config type before dialogs: {type(config)}, contents: {config}")
     toggle_dialog = ToggleDialog(root)
-    settings_dialog = SettingsDialog(root)  # Now stored in global variable
+    settings_dialog = SettingsDialog(root)
 
     # --- Pi Camera Initialization with Fault Tolerance ---
     cap = None
@@ -3883,7 +3821,7 @@ def main():
                 # Resize frame if it doesn't match expected dimensions (less likely needed here but safe)
                 if frame.shape[1] != cam1_res_w or frame.shape[0] != cam1_res_h:
                      frame = cv2.resize(frame, (cam1_res_w, cam1_res_h))
-                # PYTHON 3.14: LockFreeQueue.put() is non-blocking, drops oldest if full
+                # LockFreeQueue.put() is non-blocking, drops oldest if full
                 frame_queue.put(frame)
                 last_pi_frame = frame.copy() # Use real frame if available
             else:
@@ -4100,7 +4038,7 @@ def main():
             usb_frame_to_process = last_usb_frame # Process the last known frame (could be blank initially)
 
         # --- Handle Rotations ---
-        # PYTHON 3.14: Lock-free rotation handling using atomic state
+        # Lock-free rotation handling using atomic state
         current_cam1_rotation = cam1_state.get_rotation()
         if current_cam1_rotation != last_cam1_rotation:
             pi_previous_frame = None  # Reset for frame differencing
@@ -4108,7 +4046,7 @@ def main():
             knn_frame_counter_cam1 = 0  # Reset frame counter for new warmup period
             last_cam1_rotation = current_cam1_rotation
             time.sleep(0.05)
-            # PYTHON 3.14: Clear Pi frame queue for web feed
+            # Clear Pi frame queue for web feed
             while frame_queue.get() is not None:
                 pass  # Drain the queue
             logging.debug(f"Main: Reset Pi cam state, rotation now {current_cam1_rotation}")
@@ -4216,10 +4154,6 @@ def main():
             logging.error(f"Local stacking error: {e}")
             combined_frame = np.zeros((window_height, window_width, 3), dtype=np.uint8)
 
-        # DEBUG: Log frame info
-        if random.random() < 0.1:  # Log 10% of the time to avoid spam
-            logging.debug(f"Display: picam_valid={picam_valid}, usb_valid={usb_valid}, combined_frame shape={combined_frame.shape if combined_frame is not None else 'None'}, all_zero={np.all(combined_frame == 0) if combined_frame is not None else 'N/A'}")
-
         # Add timer information to the display
         # Either when timer is enabled or when it was recently disabled (to show notification)
         add_timer_info = timer_enabled
@@ -4248,7 +4182,7 @@ def main():
             fps_start_time = current_time
 
         # --- Update Web Frame Queue ---
-        # PYTHON 3.14: LockFreeQueue.put() is non-blocking, drops oldest if full
+        # LockFreeQueue.put() is non-blocking, drops oldest if full
         if processed_pi_frame is not None and processed_pi_frame.size > 0:
             frame_queue.put(processed_pi_frame)
 
@@ -4294,7 +4228,7 @@ def main():
 
                     # Only activate YOLO if it's enabled in config
                     if config.get('use_yolo_detection', False):
-                        # PYTHON 3.14: Declare globals for two-stage YOLO
+                        # Declare globals for two-stage YOLO
                         global yolo_stage, roi_yolo_start_time, roi_yolo_detected_person
 
                         # Activate two-stage YOLO analysis: ROI first, then full frame
@@ -4329,7 +4263,7 @@ def main():
                 
         # --- Async YOLO Analysis on Camera Feeds (if active) ---
         if yolo_analysis_active:
-            # PYTHON 3.14: Declare globals at the top of the block
+            # Declare globals at the top of the block
             global yolo_last_submission_time, yolo_pending_futures, full_frame_yolo_start_time
 
             # Check for stage-specific timeouts
@@ -4355,7 +4289,7 @@ def main():
                 detection_active = True
                 yolo_pending_futures.clear()
             else:
-                # PYTHON 3.14: Submit frame to ParallelYOLOProcessor (throttled)
+                # Submit frame to ParallelYOLOProcessor (throttled)
 
                 # Only submit if enough time has passed since last submission
                 if current_time - yolo_last_submission_time >= YOLO_SUBMISSION_INTERVAL:
@@ -4408,7 +4342,7 @@ def main():
                         yolo_last_submission_time = current_time
 
         # --- Process YOLO Results (Async) ---
-        # PYTHON 3.14: Check if any YOLO futures are ready (non-blocking)
+        # Check if any YOLO futures are ready (non-blocking)
         # Only process results if YOLO analysis is currently active to avoid stale results
         if yolo_analysis_active and yolo_pending_futures:
             # Check all pending futures for completion
